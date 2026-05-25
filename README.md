@@ -33,6 +33,18 @@ Original Project
 - Checkout Sence `Scences\SampleSceneMRTK.unity`
 - Configure project, see: https://github.com/HL2-DINO/DINO-Unity/tree/unity-21#getting-started
 
+> [!TIP]
+> If you see compile error like:
+>
+> ```
+> InvalidOperationException: Certificate Assets\WSATestCertificate.pfx is expired
+> and cannot be used for a UWP build. To fix this, either delete it or select a
+> different certificate in the player settings.
+> ```
+> 
+> Delete file `Assets\WSATestCertificate.pfx` and then select `None` as Certificate in:
+> - Edit -> Project Settings -> Player -> UWP -> Publishing Settings
+
 > [!IMPORTANT]
 > After first build, if failed with a very long compiler output, try to run `fix_win_mobile.py` in the root folder of the current project.
 
