@@ -36,6 +36,13 @@
 Shader "Unlit/GreyScale" {
     Properties{
         _MainTex("Texture", 2D) = "black" { }
+        _SourceChannel("Source Channel", Float) = 3
+        _InputMaxValue("Input Max Value", Float) = 1
+        _DisplayBlackValue("Display Black Value", Float) = 0
+        _DisplayWhiteValue("Display White Value", Float) = 1
+        _ClampMaxValue("Clamp Max Value", Float) = 65535
+        _OutputBlackValue("Output Black Value", Float) = 0
+        _InvertOutput("Invert Output", Float) = 0
     }
         SubShader{
             Pass {
@@ -47,6 +54,13 @@ Shader "Unlit/GreyScale" {
                 #include "UnityCG.cginc"
 
                 sampler2D _MainTex;
+                float _SourceChannel;
+                float _InputMaxValue;
+                float _DisplayBlackValue;
+                float _DisplayWhiteValue;
+                float _ClampMaxValue;
+                float _OutputBlackValue;
+                float _InvertOutput;
 
                 struct appdata {
                     float4 vertex : POSITION;
@@ -78,11 +92,24 @@ Shader "Unlit/GreyScale" {
                     return o;
                 }
 
+                float GetSourceChannel(float4 texel)
+                {
+                    if (_SourceChannel < 0.5f) return texel.r;
+                    if (_SourceChannel < 1.5f) return texel.g;
+                    if (_SourceChannel < 2.5f) return texel.b;
+                    return texel.a;
+                }
+
                 fixed4 frag(v2f i) : COLOR
                 {
                     UNITY_SETUP_INSTANCE_ID(i);
 
-                    float texcol = tex2D(_MainTex, i.uv).a;
+                    float rawValue = min(GetSourceChannel(tex2D(_MainTex, i.uv)) * _InputMaxValue, _ClampMaxValue);
+                    float displayRange = max(_DisplayWhiteValue - _DisplayBlackValue, 0.0001f);
+                    float normalizedValue = saturate((rawValue - _DisplayBlackValue) / displayRange);
+                    normalizedValue = lerp(normalizedValue, 1.0f - normalizedValue, step(0.5f, _InvertOutput));
+                    float texcol = lerp(_OutputBlackValue, 1.0f, normalizedValue);
+                    texcol *= step(0.0001f, rawValue);
                     return fixed4(texcol, texcol, texcol, 1.0f);
                 }
 

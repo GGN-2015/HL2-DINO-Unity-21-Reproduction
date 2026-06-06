@@ -43,14 +43,31 @@ public class ResearchModeController : MonoBehaviour
     public GameObject depthPreviewPlane = null;
     private Material depthMediaMaterial = null;
     private Texture2D depthMediaTexture = null;
-    private byte[] depthFrameData = null;
 
     public GameObject abImagePreviewPlane = null;
     private Material abImageMediaMaterial = null;
     private Texture2D abMediaTexture = null;
-    private byte[] abFrameData = null;
 
     public TMPro.TextMeshProUGUI ConsoleDebugTextMesh;
+
+    private const int SensorImageWidth = 512;
+    private const int SensorImageHeight = 512;
+    private const int SensorImagePixelCount = SensorImageWidth * SensorImageHeight;
+    private const float Raw16MaxValue = 65535f;
+    private const float DepthDisplayBlackMm = 1f;
+    private const float DepthDisplayWhiteMm = 4090f;
+    private const float SensorImageUploadIntervalSeconds = 1f / 30f;
+
+    private static readonly int SourceChannelId = Shader.PropertyToID("_SourceChannel");
+    private static readonly int InputMaxValueId = Shader.PropertyToID("_InputMaxValue");
+    private static readonly int DisplayBlackValueId = Shader.PropertyToID("_DisplayBlackValue");
+    private static readonly int DisplayWhiteValueId = Shader.PropertyToID("_DisplayWhiteValue");
+    private static readonly int ClampMaxValueId = Shader.PropertyToID("_ClampMaxValue");
+    private static readonly int OutputBlackValueId = Shader.PropertyToID("_OutputBlackValue");
+    private static readonly int InvertOutputId = Shader.PropertyToID("_InvertOutput");
+
+    private float nextSensorImageUploadTime = 0f;
+    private bool sensorImageStreamReady = false;
 
     /// <summary>
     /// Use to internally track if sensor images are updated, but also pass this into \p HL2ResearchMode to 
@@ -140,49 +157,87 @@ public class ResearchModeController : MonoBehaviour
     private void ImageTexturesSetup()
     {
         depthMediaMaterial = depthPreviewPlane.GetComponent<MeshRenderer>().material;
-        depthMediaTexture = new Texture2D(512, 512, TextureFormat.Alpha8, false);
+        depthMediaTexture = new Texture2D(SensorImageWidth, SensorImageHeight, TextureFormat.R16, false, true);
         depthMediaMaterial.mainTexture = depthMediaTexture;
+        ConfigureRaw16GrayscaleMaterial(depthMediaMaterial, DepthDisplayBlackMm, DepthDisplayWhiteMm, DepthDisplayWhiteMm, 0f, true);
 
         abImageMediaMaterial = abImagePreviewPlane.GetComponent<MeshRenderer>().material;
-        abMediaTexture = new Texture2D(512, 512, TextureFormat.Alpha8, false);
+        abMediaTexture = new Texture2D(SensorImageWidth, SensorImageHeight, TextureFormat.R16, false, true);
         abImageMediaMaterial.mainTexture = abMediaTexture;
+        ConfigureRaw16GrayscaleMaterial(abImageMediaMaterial, 0f, Raw16MaxValue, Raw16MaxValue, 0f, false);
 
     }
 
+    private void ConfigureRaw16GrayscaleMaterial(Material material, float displayBlackValue, float displayWhiteValue, float clampMaxValue, float outputBlackValue, bool invertOutput)
+    {
+        material.SetFloat(SourceChannelId, 0f);
+        material.SetFloat(InputMaxValueId, Raw16MaxValue);
+        material.SetFloat(DisplayBlackValueId, displayBlackValue);
+        material.SetFloat(DisplayWhiteValueId, displayWhiteValue);
+        material.SetFloat(ClampMaxValueId, clampMaxValue);
+        material.SetFloat(OutputBlackValueId, outputBlackValue);
+        material.SetFloat(InvertOutputId, invertOutput ? 1f : 0f);
+    }
+
+    private bool LoadRaw16TextureData(Texture2D texture, ushort[] frameData)
+    {
+        if (frameData == null || frameData.Length < SensorImagePixelCount) return false;
+
+        texture.SetPixelData(frameData, 0);
+        texture.Apply(false);
+        return true;
+    }
+
+    private void UpdateInfraredDisplayRange(ushort[] frameData)
+    {
+        if (frameData == null || frameData.Length < SensorImagePixelCount) return;
+
+        ushort minValue = ushort.MaxValue;
+        ushort maxValue = ushort.MinValue;
+
+        for (int i = 0; i < SensorImagePixelCount; ++i)
+        {
+            ushort value = frameData[i];
+            if (value < minValue) minValue = value;
+            if (value > maxValue) maxValue = value;
+        }
+
+        if (maxValue <= minValue)
+        {
+            if (maxValue < ushort.MaxValue) maxValue++;
+            else minValue--;
+        }
+
+        ConfigureRaw16GrayscaleMaterial(abImageMediaMaterial, minValue, maxValue, maxValue, 0f, false);
+    }
+
     /// <summary>
-    /// Function for receving the latest set of processed sensor images from the HL2, purely for visualisation purposes.
-    /// It should be noted the numeric values of these images have no meaningful physical information like depth info.
+    /// Function for receiving the latest raw 16-bit sensor images from the HL2 for visualisation.
+    /// Display scaling happens in the grayscale shader, with a per-frame min/max range for the infrared image.
     /// </summary>
     void GrabLatestSensorImages()
     {
 #   if ENABLE_WINMD_SUPPORT
-        // monocular depth image
-        if (researchMode.Depth8BitImageUpdated())
-        {
-            byte[] frameTexture = researchMode.Get8BitDepthImageBuf();
-            if (frameTexture.Length > 0)
-            {
-                if (depthFrameData == null) depthFrameData = frameTexture; // first frame
-                else System.Buffer.BlockCopy(frameTexture, 0, depthFrameData, 0, depthFrameData.Length);
+        if (!SensorImagesDisplaying) return;
 
-                depthMediaTexture.LoadRawTextureData(depthFrameData);
-                depthMediaTexture.Apply();
-            }
+        if (!sensorImageStreamReady)
+        {
+            sensorImageStreamReady = researchMode.Depth8BitImageUpdated() || researchMode.AB8BitImageUpdated();
+            if (!sensorImageStreamReady) return;
         }
 
-        // a labelled image of infrared response. there should be crosses on detected tool marker-centres
-        if (researchMode.AB8BitImageUpdated())
-        {
-            byte[] frameTexture = researchMode.Get8BitABImageBuf();
-            if (frameTexture.Length > 0)
-            {
-                if (abFrameData == null) abFrameData = frameTexture;
-                else System.Buffer.BlockCopy(frameTexture, 0, abFrameData, 0, abFrameData.Length);
+        if (Time.unscaledTime < nextSensorImageUploadTime) return;
 
-                abMediaTexture.LoadRawTextureData(abFrameData);
-                abMediaTexture.Apply();
-            }
+        ushort[] depthFrameTexture = researchMode.GetRawDepthImageBuffer();
+        LoadRaw16TextureData(depthMediaTexture, depthFrameTexture);
+
+        ushort[] abFrameTexture = researchMode.GetRawABImageBuffer();
+        if (LoadRaw16TextureData(abMediaTexture, abFrameTexture))
+        {
+            UpdateInfraredDisplayRange(abFrameTexture);
         }
+
+        nextSensorImageUploadTime = Time.unscaledTime + SensorImageUploadIntervalSeconds;
 #endif
     }
 
