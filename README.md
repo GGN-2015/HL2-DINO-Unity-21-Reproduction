@@ -33,6 +33,59 @@ Original Project
 - Checkout Sence `Scences\SampleSceneMRTK.unity`
 - Configure project, see: https://github.com/HL2-DINO/DINO-Unity/tree/unity-21#getting-started
 
+### Raw Sensor TCP Streaming
+
+This project can stream the HoloLens 2 raw 16-bit depth image and raw 16-bit infrared image to a Python TCP server in real time. Each frame contains two `512 x 512` `uint16` images. The Unity client sends frames from a background thread so the main Unity update loop is not blocked by TCP transfer. The C# client uses the `simple_tcp_server` L framing mode: one `L` negotiation byte when the socket connects, then `4-byte big-endian payload length + raw payload` for each request and response.
+
+The default server address is:
+
+```text
+169.254.83.86:8888
+```
+
+The provided scenes already enable this stream on `Managers/RM_Manager`, which contains the `ResearchModeController` component. The relevant Inspector fields are:
+
+- `Stream Raw Sensor Images Over Tcp`: enable or disable the TCP stream.
+- `Sensor Tcp Host`: the Python server IP address. Default: `169.254.83.86`.
+- `Sensor Tcp Port`: the Python server port. Default: `8888`.
+- `Sensor Tcp Frame Interval Seconds`: target send interval. Default: `0.033333335`, about 30 FPS.
+- `Sensor Tcp Reconnect Interval Seconds`: reconnect delay after a failed connection attempt.
+
+Start the Python server from the repository root before launching the HoloLens app:
+
+```powershell
+python -m venv venv
+venv\Scripts\python.exe -m pip install --upgrade numpy opencv-python simple-tcp-server
+venv\Scripts\python.exe DINO-Unity-21\Assets\SampleServer\RawSensorImageServer.py
+```
+
+When the server starts successfully, it prints:
+
+```text
+Raw sensor server listening on 169.254.83.86:8888
+```
+
+When the HoloLens client connects, it prints a line like:
+
+```text
+[2026-06-06 22:00:00.000000] Client connected from <client-ip>:<client-port>
+```
+
+For every received frame, the server converts the depth and infrared payloads to NumPy arrays with shape `(512, 512)` and prints the receive timestamp, frame sequence number, client timestamp, FPS, and array shapes. It also opens an OpenCV visualization window. The left image is depth, where near pixels are bright and far pixels are dark. The right image is infrared, normalized per frame with min-max scaling. Press `Q`, `Esc`, or `Ctrl+C` in the terminal to stop the server.
+
+If the server cannot bind to `169.254.83.86`, make sure that this IP exists on the PC network adapter connected to the HoloLens. If you use another server IP, update both places:
+
+1. `HOST` in `DINO-Unity-21/Assets/SampleServer/RawSensorImageServer.py`
+1. `Sensor Tcp Host` on `Managers/RM_Manager` in the Unity scene
+
+If no client connection appears in the server terminal:
+
+1. Confirm the HoloLens app was rebuilt and redeployed after the TCP changes.
+1. Confirm `Stream Raw Sensor Images Over Tcp` is enabled on `Managers/RM_Manager`.
+1. Confirm the HoloLens can reach the PC IP and port.
+1. Allow `python.exe` through Windows Firewall on the active network.
+1. Check the in-app debug text for messages such as `TCP connecting...` or `TCP connection failed...`.
+
 > [!TIP]
 > If you see compile error like:
 >

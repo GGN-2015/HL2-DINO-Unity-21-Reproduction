@@ -1397,6 +1397,11 @@ MonoBehaviour:
   depthPreviewPlane: {fileID: 3770147352547261418}
   abImagePreviewPlane: {fileID: 3770147352114868415}
   ConsoleDebugTextMesh: {fileID: 3770147353080943068}
+  streamRawSensorImagesOverTcp: 1
+  sensorTcpHost: 169.254.83.86
+  sensorTcpPort: 8888
+  sensorTcpFrameIntervalSeconds: 0.033333335
+  sensorTcpReconnectIntervalSeconds: 1
   ToolManagerScript: {fileID: 1127487041}
   JSONFilename: DinoToolsConfigMilli.json
 --- !u!1 &1828601335

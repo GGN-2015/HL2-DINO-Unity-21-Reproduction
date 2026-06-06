@@ -2,6 +2,8 @@
 using System;
 using System.Runtime.InteropServices;
 using System.IO;
+using System.Text;
+using System.Threading;
 using UnityEngine.XR.WSA;
 
 #if !UNITY_EDITOR && UNITY_WSA
@@ -50,13 +52,22 @@ public class ResearchModeController : MonoBehaviour
 
     public TMPro.TextMeshProUGUI ConsoleDebugTextMesh;
 
+    [Header("Raw Sensor TCP Stream")]
+    public bool streamRawSensorImagesOverTcp = true;
+    public string sensorTcpHost = "169.254.83.86";
+    public int sensorTcpPort = 8888;
+    public float sensorTcpFrameIntervalSeconds = 1f / 30f;
+    public float sensorTcpReconnectIntervalSeconds = 1.0f;
+
     private const int SensorImageWidth = 512;
     private const int SensorImageHeight = 512;
     private const int SensorImagePixelCount = SensorImageWidth * SensorImageHeight;
+    private const int SensorTcpHeaderBytes = 40;
     private const float Raw16MaxValue = 65535f;
     private const float DepthDisplayBlackMm = 1f;
     private const float DepthDisplayWhiteMm = 4090f;
     private const float SensorImageUploadIntervalSeconds = 1f / 30f;
+    private static readonly byte[] SensorTcpPayloadMagic = Encoding.ASCII.GetBytes("DINOIMG1");
 
     private static readonly int SourceChannelId = Shader.PropertyToID("_SourceChannel");
     private static readonly int InputMaxValueId = Shader.PropertyToID("_InputMaxValue");
@@ -68,6 +79,17 @@ public class ResearchModeController : MonoBehaviour
 
     private float nextSensorImageUploadTime = 0f;
     private bool sensorImageStreamReady = false;
+    private float nextSensorTcpQueueTime = 0f;
+    private ulong sensorTcpFrameSequence = 0;
+    private volatile bool sensorTcpRunning = false;
+    private Thread sensorTcpThread = null;
+    private SimpleTcpClient sensorTcpClient = null;
+    private byte[] sensorTcpPayloadBuffer = null;
+    private RawSensorTcpFrame latestSensorTcpFrame = null;
+    private readonly object sensorTcpFrameLock = new object();
+    private readonly object sensorTcpStatusLock = new object();
+    private string sensorTcpStatusMessage = string.Empty;
+    private bool sensorTcpStatusDirty = false;
 
     /// <summary>
     /// Use to internally track if sensor images are updated, but also pass this into \p HL2ResearchMode to 
@@ -90,6 +112,7 @@ public class ResearchModeController : MonoBehaviour
     {
         // (1) Caching/attaching Unity objects
         ImageTexturesSetup();
+        StartSensorTcpThread();
 
         // (2) Reading tool config data from file
         string toolConfigJSONString = ToolConfigJSONSetup();
@@ -211,6 +234,262 @@ public class ResearchModeController : MonoBehaviour
         ConfigureRaw16GrayscaleMaterial(abImageMediaMaterial, minValue, maxValue, maxValue, 0f, false);
     }
 
+    private void StartSensorTcpThread()
+    {
+        if (!streamRawSensorImagesOverTcp || sensorTcpThread != null) return;
+
+        sensorTcpRunning = true;
+        sensorTcpThread = new Thread(SensorTcpBackgroundLoop)
+        {
+            IsBackground = true,
+            Name = "DINO Raw Sensor TCP Sender"
+        };
+        sensorTcpThread.Start();
+    }
+
+    private void StopSensorTcpThread()
+    {
+        sensorTcpRunning = false;
+
+        lock (sensorTcpFrameLock)
+        {
+            Monitor.PulseAll(sensorTcpFrameLock);
+        }
+
+        try { sensorTcpClient?.Close(); }
+        catch { }
+
+        if (sensorTcpThread != null && sensorTcpThread.IsAlive)
+        {
+            sensorTcpThread.Join(1000);
+        }
+
+        sensorTcpThread = null;
+        latestSensorTcpFrame = null;
+        sensorTcpPayloadBuffer = null;
+    }
+
+    private void SetSensorTcpStatus(string message)
+    {
+        lock (sensorTcpStatusLock)
+        {
+            if (sensorTcpStatusMessage == message) return;
+
+            sensorTcpStatusMessage = message;
+            sensorTcpStatusDirty = true;
+        }
+    }
+
+    private void ApplySensorTcpStatusToScreen()
+    {
+        string message = null;
+
+        lock (sensorTcpStatusLock)
+        {
+            if (!sensorTcpStatusDirty) return;
+
+            message = sensorTcpStatusMessage;
+            sensorTcpStatusDirty = false;
+        }
+
+        if (ConsoleDebugTextMesh != null && !string.IsNullOrEmpty(message))
+        {
+            ConsoleDebugTextMesh.text = message;
+        }
+    }
+
+    private void QueueRawSensorFrameForTcp(ushort[] depthFrame, ushort[] infraredFrame)
+    {
+        if (!streamRawSensorImagesOverTcp || !sensorTcpRunning) return;
+        if (depthFrame == null || infraredFrame == null) return;
+        if (depthFrame.Length < SensorImagePixelCount || infraredFrame.Length < SensorImagePixelCount) return;
+        if (Time.unscaledTime < nextSensorTcpQueueTime) return;
+
+        float frameInterval = Mathf.Clamp(sensorTcpFrameIntervalSeconds, 0f, SensorImageUploadIntervalSeconds);
+        nextSensorTcpQueueTime = Time.unscaledTime + frameInterval;
+
+        RawSensorTcpFrame frame = new RawSensorTcpFrame
+        {
+            Depth = depthFrame,
+            Infrared = infraredFrame,
+            Sequence = ++sensorTcpFrameSequence,
+            TimestampUnixSeconds = GetUnixTimeSeconds()
+        };
+
+        lock (sensorTcpFrameLock)
+        {
+            latestSensorTcpFrame = frame;
+            Monitor.Pulse(sensorTcpFrameLock);
+        }
+    }
+
+    private RawSensorTcpFrame WaitForLatestSensorTcpFrame()
+    {
+        lock (sensorTcpFrameLock)
+        {
+            while (sensorTcpRunning && latestSensorTcpFrame == null)
+            {
+                Monitor.Wait(sensorTcpFrameLock, 250);
+            }
+
+            if (!sensorTcpRunning) return null;
+
+            RawSensorTcpFrame frame = latestSensorTcpFrame;
+            latestSensorTcpFrame = null;
+            return frame;
+        }
+    }
+
+    private void SensorTcpBackgroundLoop()
+    {
+        while (sensorTcpRunning)
+        {
+            if (!EnsureSensorTcpConnected())
+            {
+                continue;
+            }
+
+            RawSensorTcpFrame frame = WaitForLatestSensorTcpFrame();
+            if (frame == null) continue;
+
+            byte[] payload = BuildRawSensorTcpPayload(frame, ref sensorTcpPayloadBuffer);
+            byte[] response = sensorTcpClient.Request(payload);
+            if (response == null)
+            {
+                string reason = GetSensorTcpErrorReason(sensorTcpClient);
+                sensorTcpClient.Dispose();
+                sensorTcpClient = null;
+                SetSensorTcpStatus($"TCP connection failed: {reason}. Reconnecting to {sensorTcpHost}:{sensorTcpPort}.");
+                SleepSensorTcpThread(250);
+                continue;
+            }
+
+            if (!IsOkSensorTcpResponse(response))
+            {
+                string responseText = Encoding.ASCII.GetString(response);
+                sensorTcpClient.Dispose();
+                sensorTcpClient = null;
+                SetSensorTcpStatus($"TCP connection failed: server returned unexpected response '{responseText}'. Reconnecting to {sensorTcpHost}:{sensorTcpPort}.");
+                SleepSensorTcpThread(250);
+            }
+        }
+
+        sensorTcpClient?.Dispose();
+        sensorTcpClient = null;
+        sensorTcpPayloadBuffer = null;
+    }
+
+    private bool EnsureSensorTcpConnected()
+    {
+        if (sensorTcpClient != null && sensorTcpClient.IsConnected) return true;
+
+        sensorTcpClient?.Dispose();
+        sensorTcpClient = null;
+
+        string host = sensorTcpHost;
+        int port = sensorTcpPort;
+        float retrySeconds = Math.Max(0.1f, sensorTcpReconnectIntervalSeconds);
+
+        SetSensorTcpStatus($"TCP connecting to {host}:{port}...");
+
+        SimpleTcpClient client = new SimpleTcpClient(host, port);
+        if (!client.IsConnected)
+        {
+            string reason = GetSensorTcpErrorReason(client);
+            client.Dispose();
+            SetSensorTcpStatus($"TCP connection failed: {reason}. Retrying {host}:{port} in {retrySeconds:0.0}s.");
+            SleepSensorTcpThread((int)(retrySeconds * 1000f));
+            return false;
+        }
+
+        sensorTcpClient = client;
+        SetSensorTcpStatus($"TCP connected to {host}:{port}.");
+        return true;
+    }
+
+    private static string GetSensorTcpErrorReason(SimpleTcpClient client)
+    {
+        if (client == null || string.IsNullOrEmpty(client.LastError)) return "Unknown error";
+        return client.LastError;
+    }
+
+    private static bool IsOkSensorTcpResponse(byte[] response)
+    {
+        return response != null && response.Length == 2 && response[0] == (byte)'o' && response[1] == (byte)'k';
+    }
+
+    private void SleepSensorTcpThread(int milliseconds)
+    {
+        int remaining = Math.Max(0, milliseconds);
+        while (sensorTcpRunning && remaining > 0)
+        {
+            int sleepNow = Math.Min(remaining, 100);
+            Thread.Sleep(sleepNow);
+            remaining -= sleepNow;
+        }
+    }
+
+    private static byte[] BuildRawSensorTcpPayload(RawSensorTcpFrame frame, ref byte[] payload)
+    {
+        int depthByteLength = SensorImagePixelCount * sizeof(ushort);
+        int infraredByteLength = SensorImagePixelCount * sizeof(ushort);
+        int payloadLength = SensorTcpHeaderBytes + depthByteLength + infraredByteLength;
+        if (payload == null || payload.Length != payloadLength)
+        {
+            payload = new byte[payloadLength];
+        }
+
+        int offset = 0;
+
+        WriteBytes(payload, ref offset, SensorTcpPayloadMagic);
+        WriteInt32(payload, ref offset, SensorImageWidth);
+        WriteInt32(payload, ref offset, SensorImageHeight);
+        WriteUInt64(payload, ref offset, frame.Sequence);
+        WriteDouble(payload, ref offset, frame.TimestampUnixSeconds);
+        WriteInt32(payload, ref offset, SensorImagePixelCount);
+        WriteInt32(payload, ref offset, SensorImagePixelCount);
+
+        Buffer.BlockCopy(frame.Depth, 0, payload, offset, depthByteLength);
+        offset += depthByteLength;
+        Buffer.BlockCopy(frame.Infrared, 0, payload, offset, infraredByteLength);
+
+        return payload;
+    }
+
+    private static void WriteBytes(byte[] target, ref int offset, byte[] value)
+    {
+        Buffer.BlockCopy(value, 0, target, offset, value.Length);
+        offset += value.Length;
+    }
+
+    private static void WriteInt32(byte[] target, ref int offset, int value)
+    {
+        WriteLittleEndianBytes(target, ref offset, BitConverter.GetBytes(value));
+    }
+
+    private static void WriteUInt64(byte[] target, ref int offset, ulong value)
+    {
+        WriteLittleEndianBytes(target, ref offset, BitConverter.GetBytes(value));
+    }
+
+    private static void WriteDouble(byte[] target, ref int offset, double value)
+    {
+        WriteLittleEndianBytes(target, ref offset, BitConverter.GetBytes(value));
+    }
+
+    private static void WriteLittleEndianBytes(byte[] target, ref int offset, byte[] value)
+    {
+        if (!BitConverter.IsLittleEndian) Array.Reverse(value);
+        Buffer.BlockCopy(value, 0, target, offset, value.Length);
+        offset += value.Length;
+    }
+
+    private static double GetUnixTimeSeconds()
+    {
+        DateTime unixEpoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        return (DateTime.UtcNow - unixEpoch).TotalSeconds;
+    }
+
     /// <summary>
     /// Function for receiving the latest raw 16-bit sensor images from the HL2 for visualisation.
     /// Display scaling happens in the grayscale shader, with a per-frame min/max range for the infrared image.
@@ -236,6 +515,8 @@ public class ResearchModeController : MonoBehaviour
         {
             UpdateInfraredDisplayRange(abFrameTexture);
         }
+
+        QueueRawSensorFrameForTcp(depthFrameTexture, abFrameTexture);
 
         nextSensorImageUploadTime = Time.unscaledTime + SensorImageUploadIntervalSeconds;
 #endif
@@ -271,6 +552,7 @@ public class ResearchModeController : MonoBehaviour
         GrabLatestSensorImages();
         GrabLatestToolDictionary();
 #endif
+        ApplySensorTcpStatusToScreen();
     }
 
 #if WINDOWS_UWP
@@ -331,10 +613,15 @@ public class ResearchModeController : MonoBehaviour
 #endif
 
 
-        private void OnApplicationFocus(bool focus)
+    private void OnApplicationFocus(bool focus)
     {
         // if app is shutdown, try to stop the sensor loop running
         if (!focus) StopDepthSensor();
+    }
+
+    private void OnDestroy()
+    {
+        StopSensorTcpThread();
     }
 
     /// <summary>
@@ -376,5 +663,13 @@ public class ResearchModeController : MonoBehaviour
         ConsoleDebugTextMesh.text = profileString;
         await SaveProfilerString(profileString, $"DINO-AR_Profile_Unity{Application.unityVersion}.txt");
 #endif
+    }
+
+    private class RawSensorTcpFrame
+    {
+        public ushort[] Depth;
+        public ushort[] Infrared;
+        public ulong Sequence;
+        public double TimestampUnixSeconds;
     }
 }
