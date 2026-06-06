@@ -48,7 +48,7 @@ The provided scenes already enable this stream on `Managers/RM_Manager`, which c
 - `Stream Raw Sensor Images Over Tcp`: enable or disable the TCP stream.
 - `Sensor Tcp Host`: the Python server IP address. Default: `169.254.83.86`.
 - `Sensor Tcp Port`: the Python server port. Default: `8888`.
-- `Sensor Tcp Frame Interval Seconds`: target send interval. Default: `0.033333335`, about 30 FPS.
+- `Sensor Tcp Frame Interval Seconds`: target send interval. Default: `0.033333335`, about 30 FPS (24 FPS in real world).
 - `Sensor Tcp Reconnect Interval Seconds`: reconnect delay after a failed connection attempt.
 
 Start the Python server from the repository root before launching the HoloLens app:
@@ -72,6 +72,45 @@ When the HoloLens client connects, it prints a line like:
 ```
 
 For every received frame, the server converts the depth and infrared payloads to NumPy arrays with shape `(512, 512)` and prints the receive timestamp, frame sequence number, client timestamp, FPS, and array shapes. It also opens an OpenCV visualization window. The left image is depth, where near pixels are bright and far pixels are dark. The right image is infrared, normalized per frame with min-max scaling. Press `Q`, `Esc`, or `Ctrl+C` in the terminal to stop the server.
+
+You can also import the server module from your own Python code and read the latest raw images directly:
+
+```python
+import sys
+import time
+from pathlib import Path
+
+sys.path.append(str(Path("DINO-Unity-21/Assets/SampleServer").resolve()))
+
+from RawSensorImageServer import RawSensorImageReceiver
+
+receiver = RawSensorImageReceiver(host="169.254.83.86", port=8888)
+receiver.start()
+
+try:
+    while True:
+        images = receiver.wait_for_next_images(timeout=1.0)
+        if images is None:
+            print("Waiting for HoloLens frames...")
+            continue
+
+        depth, infrared = images
+        print(depth.shape, depth.dtype, infrared.shape, infrared.dtype)
+        time.sleep(0.01)
+finally:
+    receiver.stop()
+```
+
+The receiver API returns NumPy arrays with dtype `uint16`:
+
+- `receiver.get_current_depth_image()`: returns the latest depth image, or `None` before the first frame arrives.
+- `receiver.get_current_infrared_image()`: returns the latest infrared image, or `None` before the first frame arrives.
+- `receiver.get_current_images()`: returns `(depth, infrared)`, or `None` before the first frame arrives.
+- `receiver.wait_for_images(timeout=1.0)`: waits until at least one frame is available and returns `(depth, infrared)`, or `None` on timeout.
+- `receiver.wait_for_next_images(timeout=1.0)`: waits for a newer frame than the current one and returns `(depth, infrared)`, or `None` on timeout.
+- `receiver.get_current_frame()`: returns metadata plus the two images. The metadata includes `sequence`, `client_timestamp`, and `received_timestamp`.
+
+By default the getter methods return copies so caller code cannot accidentally mutate the receiver's live frame. Pass `copy=False` if you need lower overhead and will treat the arrays as read-only.
 
 If the server cannot bind to `169.254.83.86`, make sure that this IP exists on the PC network adapter connected to the HoloLens. If you use another server IP, update both places:
 

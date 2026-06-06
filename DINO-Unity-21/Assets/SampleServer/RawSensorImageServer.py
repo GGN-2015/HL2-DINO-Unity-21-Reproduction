@@ -38,7 +38,7 @@ class SensorFrame:
 
 @dataclass
 class SharedState:
-    lock: threading.Lock = field(default_factory=threading.Lock)
+    lock: threading.Condition = field(default_factory=threading.Condition)
     latest_frame: SensorFrame | None = None
     receive_fps: float = 0.0
     last_error: str = ""
@@ -74,6 +74,16 @@ class FpsCounter:
             return 0.0
 
         return (len(self.samples) - 1) / elapsed
+
+
+def copy_sensor_frame(frame: SensorFrame) -> SensorFrame:
+    return SensorFrame(
+        depth=frame.depth.copy(),
+        infrared=frame.infrared.copy(),
+        sequence=frame.sequence,
+        client_timestamp=frame.client_timestamp,
+        received_timestamp=frame.received_timestamp,
+    )
 
 
 def parse_sensor_images(message: bytes) -> tuple[np.ndarray, np.ndarray, int, float]:
@@ -172,6 +182,7 @@ def process_message(message: bytes, state: SharedState, fps_counter: FpsCounter)
         state.latest_frame = frame
         state.receive_fps = receive_fps
         state.last_error = ""
+        state.lock.notify_all()
 
     received = datetime.fromtimestamp(received_timestamp)
     print(
@@ -184,37 +195,174 @@ def process_message(message: bytes, state: SharedState, fps_counter: FpsCounter)
     return b"ok"
 
 
-def server_loop(state: SharedState, stop_event: threading.Event) -> None:
-    fps_counter = FpsCounter()
+class RawSensorImageReceiver:
+    def __init__(
+        self,
+        host: str = HOST,
+        port: int = PORT,
+        client_timeout: float = 3600.0,
+        print_frame_log: bool = True,
+    ) -> None:
+        self.host = host
+        self.port = port
+        self.client_timeout = client_timeout
+        self.print_frame_log = print_frame_log
+        self.state = SharedState()
+        self.stop_event = threading.Event()
+        self.server_thread: threading.Thread | None = None
+        self.server: RawSensorTcpServer | None = None
+        self.fps_counter = FpsCounter()
 
-    def raw_sensor_worker(message: bytes) -> bytes:
+    def start(self) -> None:
+        if self.server_thread is not None and self.server_thread.is_alive():
+            return
+
+        self.stop_event.clear()
+        self.server_thread = threading.Thread(target=self._server_loop, name="RawSensorTcpServer", daemon=True)
+        self.server_thread.start()
+
+    def stop(self, join_timeout: float = 1.0) -> None:
+        self.stop_event.set()
+        if self.server is not None:
+            self.server.running = False
+
+        if self.server_thread is not None:
+            self.server_thread.join(timeout=join_timeout)
+            self.server_thread = None
+
+    def get_current_frame(self, copy: bool = True) -> SensorFrame | None:
+        with self.state.lock:
+            if self.state.latest_frame is None:
+                return None
+
+            return copy_sensor_frame(self.state.latest_frame) if copy else self.state.latest_frame
+
+    def get_current_depth_image(self, copy: bool = True) -> np.ndarray | None:
+        frame = self.get_current_frame(copy=copy)
+        return None if frame is None else frame.depth
+
+    def get_current_infrared_image(self, copy: bool = True) -> np.ndarray | None:
+        frame = self.get_current_frame(copy=copy)
+        return None if frame is None else frame.infrared
+
+    def get_current_images(self, copy: bool = True) -> tuple[np.ndarray, np.ndarray] | None:
+        frame = self.get_current_frame(copy=copy)
+        if frame is None:
+            return None
+
+        return frame.depth, frame.infrared
+
+    def wait_for_frame(self, timeout: float | None = None, copy: bool = True) -> SensorFrame | None:
+        with self.state.lock:
+            if self.state.latest_frame is None:
+                self.state.lock.wait(timeout=timeout)
+
+            if self.state.latest_frame is None:
+                return None
+
+            return copy_sensor_frame(self.state.latest_frame) if copy else self.state.latest_frame
+
+    def wait_for_next_frame(self, timeout: float | None = None, copy: bool = True) -> SensorFrame | None:
+        with self.state.lock:
+            previous_sequence = None if self.state.latest_frame is None else self.state.latest_frame.sequence
+            deadline = None if timeout is None else time.monotonic() + timeout
+
+            while True:
+                current_frame = self.state.latest_frame
+                if current_frame is not None and current_frame.sequence != previous_sequence:
+                    return copy_sensor_frame(current_frame) if copy else current_frame
+
+                if deadline is None:
+                    self.state.lock.wait()
+                    continue
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return None
+
+                self.state.lock.wait(timeout=remaining)
+
+    def wait_for_images(self, timeout: float | None = None, copy: bool = True) -> tuple[np.ndarray, np.ndarray] | None:
+        frame = self.wait_for_frame(timeout=timeout, copy=copy)
+        if frame is None:
+            return None
+
+        return frame.depth, frame.infrared
+
+    def wait_for_next_images(self, timeout: float | None = None, copy: bool = True) -> tuple[np.ndarray, np.ndarray] | None:
+        frame = self.wait_for_next_frame(timeout=timeout, copy=copy)
+        if frame is None:
+            return None
+
+        return frame.depth, frame.infrared
+
+    def get_receive_fps(self) -> float:
+        with self.state.lock:
+            return self.state.receive_fps
+
+    def get_last_error(self) -> str:
+        with self.state.lock:
+            return self.state.last_error
+
+    def _raw_sensor_worker(self, message: bytes) -> bytes:
         if message == b"quit":
-            stop_event.set()
+            self.stop_event.set()
             return b"ok"
 
         try:
-            return process_message(message, state, fps_counter)
+            if self.print_frame_log:
+                return process_message(message, self.state, self.fps_counter)
+
+            depth, infrared, sequence, client_timestamp = parse_sensor_images(message)
+            received_timestamp = time.time()
+            receive_fps = self.fps_counter.tick(time.perf_counter())
+            frame = SensorFrame(depth, infrared, sequence, client_timestamp, received_timestamp)
+            with self.state.lock:
+                self.state.latest_frame = frame
+                self.state.receive_fps = receive_fps
+                self.state.last_error = ""
+                self.state.lock.notify_all()
+
+            return b"ok"
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
-            with state.lock:
-                state.last_error = error
+            with self.state.lock:
+                self.state.last_error = error
+                self.state.lock.notify_all()
             print(f"Packet error: {error}", flush=True)
             return b"error"
 
-    print(f"Raw sensor server listening on {HOST}:{PORT}", flush=True)
-    server = RawSensorTcpServer(HOST, PORT, raw_sensor_worker, quit_token=b"quit", client_timeout=3600.0)
-    server.set_debug_mode(False)
+    def _server_loop(self) -> None:
+        print(f"Raw sensor server listening on {self.host}:{self.port}", flush=True)
+        self.server = RawSensorTcpServer(
+            self.host,
+            self.port,
+            self._raw_sensor_worker,
+            quit_token=b"quit",
+            client_timeout=self.client_timeout,
+        )
+        self.server.set_debug_mode(False)
 
-    while not stop_event.is_set() and server.running:
-        server._try_accept()
-        server._acquire_all()
-        server._response_all()
-        server._kick_timeout()
-        time.sleep(0.001)
+        try:
+            while not self.stop_event.is_set() and self.server.running:
+                self.server._try_accept()
+                self.server._acquire_all()
+                self.server._response_all()
+                self.server._kick_timeout()
+                time.sleep(0.001)
+        finally:
+            if self.server is not None:
+                self.server.running = False
+                self.server._kick_all()
+                self.server.server_socket.close()
+                self.server = None
 
-    server.running = False
-    server._kick_all()
-    server.server_socket.close()
+
+def server_loop(state: SharedState, stop_event: threading.Event) -> None:
+    receiver = RawSensorImageReceiver()
+    receiver.state = state
+    receiver.stop_event = stop_event
+    receiver._server_loop()
 
 
 def visualization_loop(state: SharedState, stop_event: threading.Event) -> None:
@@ -255,27 +403,87 @@ def visualization_loop(state: SharedState, stop_event: threading.Event) -> None:
     cv2.destroyAllWindows()
 
 
+_default_receiver: RawSensorImageReceiver | None = None
+
+
+def start_receiver(
+    host: str = HOST,
+    port: int = PORT,
+    show_visualization: bool = False,
+    print_frame_log: bool = True,
+) -> RawSensorImageReceiver:
+    global _default_receiver
+
+    receiver = RawSensorImageReceiver(host=host, port=port, print_frame_log=print_frame_log)
+    receiver.start()
+    _default_receiver = receiver
+
+    if show_visualization:
+        visualization_loop(receiver.state, receiver.stop_event)
+
+    return receiver
+
+
+def stop_receiver() -> None:
+    global _default_receiver
+
+    if _default_receiver is not None:
+        _default_receiver.stop()
+        _default_receiver = None
+
+
+def get_current_depth_image(copy: bool = True) -> np.ndarray | None:
+    if _default_receiver is None:
+        return None
+
+    return _default_receiver.get_current_depth_image(copy=copy)
+
+
+def get_current_infrared_image(copy: bool = True) -> np.ndarray | None:
+    if _default_receiver is None:
+        return None
+
+    return _default_receiver.get_current_infrared_image(copy=copy)
+
+
+def get_current_images(copy: bool = True) -> tuple[np.ndarray, np.ndarray] | None:
+    if _default_receiver is None:
+        return None
+
+    return _default_receiver.get_current_images(copy=copy)
+
+
+def wait_for_images(timeout: float | None = None, copy: bool = True) -> tuple[np.ndarray, np.ndarray] | None:
+    if _default_receiver is None:
+        return None
+
+    return _default_receiver.wait_for_images(timeout=timeout, copy=copy)
+
+
+def wait_for_next_images(timeout: float | None = None, copy: bool = True) -> tuple[np.ndarray, np.ndarray] | None:
+    if _default_receiver is None:
+        return None
+
+    return _default_receiver.wait_for_next_images(timeout=timeout, copy=copy)
+
+
 def main() -> None:
-    state = SharedState()
-    stop_event = threading.Event()
+    receiver = RawSensorImageReceiver()
 
     def request_shutdown(signum: int, frame: object) -> None:
         print(SHUTDOWN_MESSAGE, flush=True)
-        stop_event.set()
+        receiver.stop_event.set()
 
     signal.signal(signal.SIGINT, request_shutdown)
-
-    server_thread = threading.Thread(target=server_loop, args=(state, stop_event), name="RawSensorTcpServer", daemon=True)
-    server_thread.start()
+    receiver.start()
 
     try:
         print("Press Ctrl+C in this terminal, or press Q/Esc in the image window, to exit.", flush=True)
-        visualization_loop(state, stop_event)
+        visualization_loop(receiver.state, receiver.stop_event)
     except KeyboardInterrupt:
         print(SHUTDOWN_MESSAGE, flush=True)
     finally:
-        stop_event.set()
-        server_thread.join(timeout=1.0)
+        receiver.stop()
 
 
 if __name__ == "__main__":
