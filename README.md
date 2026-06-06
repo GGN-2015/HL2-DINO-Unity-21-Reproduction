@@ -141,4 +141,4 @@ If no client connection appears in the server terminal:
 > After first build, if failed with a very long compiler output, try to run `fix_win_mobile.py` in the root folder of the current project.
 
 - Configure device portal in Build Settings, keep Hololens2 on, and then click `Build and Run`.
-- The project will be packed and then send to your device, it may take about 4min to compile the project.
+- The project will be packed and then send to your device, it may take about 6min to compile the project.
