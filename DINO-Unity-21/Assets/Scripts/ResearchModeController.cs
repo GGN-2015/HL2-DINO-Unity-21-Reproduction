@@ -4,7 +4,9 @@ using System.Runtime.InteropServices;
 using System.IO;
 using System.Text;
 using System.Threading;
+using System.Collections.Generic;
 using UnityEngine.XR.WSA;
+using Newtonsoft.Json.Linq;
 
 #if !UNITY_EDITOR && UNITY_WSA
 using Windows.Perception.Spatial;
@@ -67,7 +69,11 @@ public class ResearchModeController : MonoBehaviour
     private const float DepthDisplayBlackMm = 1f;
     private const float DepthDisplayWhiteMm = 4090f;
     private const float SensorImageUploadIntervalSeconds = 1f / 30f;
+    private static readonly byte[] SensorTcpRawStreamPrefix = Encoding.ASCII.GetBytes("raw_stream:");
+    private static readonly byte[] SensorTcpIrMarkersRequest = Encoding.ASCII.GetBytes("ir_markers:");
     private static readonly byte[] SensorTcpPayloadMagic = Encoding.ASCII.GetBytes("DINOIMG1");
+    private const float MarkerPollingIntervalSeconds = 1f / 15f;
+    private const float MarkerSphereDiameterMetres = 0.01f;
 
     private static readonly int SourceChannelId = Shader.PropertyToID("_SourceChannel");
     private static readonly int InputMaxValueId = Shader.PropertyToID("_InputMaxValue");
@@ -90,6 +96,14 @@ public class ResearchModeController : MonoBehaviour
     private readonly object sensorTcpStatusLock = new object();
     private string sensorTcpStatusMessage = string.Empty;
     private bool sensorTcpStatusDirty = false;
+    private Thread markerTcpThread = null;
+    private SimpleTcpClient markerTcpClient = null;
+    private volatile bool markerTcpRunning = false;
+    private readonly object markerPixelsLock = new object();
+    private List<Vector2> latestMarkerPixels = new List<Vector2>();
+    private bool newMarkerPixelsReceived = false;
+    private readonly List<GameObject> markerWorldSpheres = new List<GameObject>();
+    private Material markerSphereMaterial = null;
 
     /// <summary>
     /// Use to internally track if sensor images are updated, but also pass this into \p HL2ResearchMode to 
@@ -113,6 +127,7 @@ public class ResearchModeController : MonoBehaviour
         // (1) Caching/attaching Unity objects
         ImageTexturesSetup();
         StartSensorTcpThread();
+        StartMarkerTcpThread();
 
         // (2) Reading tool config data from file
         string toolConfigJSONString = ToolConfigJSONSetup();
@@ -269,6 +284,35 @@ public class ResearchModeController : MonoBehaviour
         sensorTcpPayloadBuffer = null;
     }
 
+    private void StartMarkerTcpThread()
+    {
+        if (markerTcpThread != null) return;
+
+        markerTcpRunning = true;
+        markerTcpThread = new Thread(MarkerTcpBackgroundLoop)
+        {
+            IsBackground = true,
+            Name = "DINO IR Marker TCP Receiver"
+        };
+        markerTcpThread.Start();
+    }
+
+    private void StopMarkerTcpThread()
+    {
+        markerTcpRunning = false;
+
+        try { markerTcpClient?.Close(); }
+        catch { }
+
+        if (markerTcpThread != null && markerTcpThread.IsAlive)
+        {
+            markerTcpThread.Join(1000);
+        }
+
+        markerTcpThread = null;
+        markerTcpClient = null;
+    }
+
     private void SetSensorTcpStatus(string message)
     {
         lock (sensorTcpStatusLock)
@@ -379,6 +423,47 @@ public class ResearchModeController : MonoBehaviour
         sensorTcpPayloadBuffer = null;
     }
 
+    private void MarkerTcpBackgroundLoop()
+    {
+        while (markerTcpRunning)
+        {
+            if (!EnsureMarkerTcpConnected())
+            {
+                continue;
+            }
+
+            byte[] response = markerTcpClient.Request(SensorTcpIrMarkersRequest);
+            if (response == null)
+            {
+                string reason = GetSensorTcpErrorReason(markerTcpClient);
+                markerTcpClient.Dispose();
+                markerTcpClient = null;
+                SetSensorTcpStatus($"IR marker TCP failed: {reason}. Reconnecting to {sensorTcpHost}:{sensorTcpPort}.");
+                SleepMarkerTcpThread(250);
+                continue;
+            }
+
+            try
+            {
+                List<Vector2> markerPixels = ParseMarkerPixelResponse(response);
+                lock (markerPixelsLock)
+                {
+                    latestMarkerPixels = markerPixels;
+                    newMarkerPixelsReceived = true;
+                }
+            }
+            catch (Exception ex)
+            {
+                SetSensorTcpStatus($"IR marker response parse failed: {ex.Message}");
+            }
+
+            SleepMarkerTcpThread((int)(MarkerPollingIntervalSeconds * 1000f));
+        }
+
+        markerTcpClient?.Dispose();
+        markerTcpClient = null;
+    }
+
     private bool EnsureSensorTcpConnected()
     {
         if (sensorTcpClient != null && sensorTcpClient.IsConnected) return true;
@@ -407,6 +492,31 @@ public class ResearchModeController : MonoBehaviour
         return true;
     }
 
+    private bool EnsureMarkerTcpConnected()
+    {
+        if (markerTcpClient != null && markerTcpClient.IsConnected) return true;
+
+        markerTcpClient?.Dispose();
+        markerTcpClient = null;
+
+        string host = sensorTcpHost;
+        int port = sensorTcpPort;
+        float retrySeconds = Math.Max(0.1f, sensorTcpReconnectIntervalSeconds);
+
+        SimpleTcpClient client = new SimpleTcpClient(host, port);
+        if (!client.IsConnected)
+        {
+            string reason = GetSensorTcpErrorReason(client);
+            client.Dispose();
+            SetSensorTcpStatus($"IR marker TCP failed: {reason}. Retrying {host}:{port} in {retrySeconds:0.0}s.");
+            SleepMarkerTcpThread((int)(retrySeconds * 1000f));
+            return false;
+        }
+
+        markerTcpClient = client;
+        return true;
+    }
+
     private static string GetSensorTcpErrorReason(SimpleTcpClient client)
     {
         if (client == null || string.IsNullOrEmpty(client.LastError)) return "Unknown error";
@@ -429,11 +539,40 @@ public class ResearchModeController : MonoBehaviour
         }
     }
 
+    private void SleepMarkerTcpThread(int milliseconds)
+    {
+        int remaining = Math.Max(0, milliseconds);
+        while (markerTcpRunning && remaining > 0)
+        {
+            int sleepNow = Math.Min(remaining, 100);
+            Thread.Sleep(sleepNow);
+            remaining -= sleepNow;
+        }
+    }
+
+    private static List<Vector2> ParseMarkerPixelResponse(byte[] response)
+    {
+        string json = Encoding.UTF8.GetString(response);
+        JArray markerArray = JArray.Parse(json);
+        List<Vector2> markerPixels = new List<Vector2>();
+
+        foreach (var markerToken in markerArray)
+        {
+            if (!(markerToken is JArray marker) || marker.Count < 2) continue;
+
+            markerPixels.Add(new Vector2(
+                marker[0].ToObject<float>(),
+                marker[1].ToObject<float>()));
+        }
+
+        return markerPixels;
+    }
+
     private static byte[] BuildRawSensorTcpPayload(RawSensorTcpFrame frame, ref byte[] payload)
     {
         int depthByteLength = SensorImagePixelCount * sizeof(ushort);
         int infraredByteLength = SensorImagePixelCount * sizeof(ushort);
-        int payloadLength = SensorTcpHeaderBytes + depthByteLength + infraredByteLength;
+        int payloadLength = SensorTcpRawStreamPrefix.Length + SensorTcpHeaderBytes + depthByteLength + infraredByteLength;
         if (payload == null || payload.Length != payloadLength)
         {
             payload = new byte[payloadLength];
@@ -441,6 +580,7 @@ public class ResearchModeController : MonoBehaviour
 
         int offset = 0;
 
+        WriteBytes(payload, ref offset, SensorTcpRawStreamPrefix);
         WriteBytes(payload, ref offset, SensorTcpPayloadMagic);
         WriteInt32(payload, ref offset, SensorImageWidth);
         WriteInt32(payload, ref offset, SensorImageHeight);
@@ -488,6 +628,92 @@ public class ResearchModeController : MonoBehaviour
     {
         DateTime unixEpoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
         return (DateTime.UtcNow - unixEpoch).TotalSeconds;
+    }
+
+    private void ApplyLatestMarkerPixels()
+    {
+        List<Vector2> markerPixels = null;
+        lock (markerPixelsLock)
+        {
+            if (!newMarkerPixelsReceived) return;
+
+            markerPixels = new List<Vector2>(latestMarkerPixels);
+            newMarkerPixelsReceived = false;
+        }
+
+        List<Vector3> markerWorldPositions = ResolveMarkerWorldPositions(markerPixels);
+        ReplaceMarkerWorldSpheres(markerWorldPositions);
+    }
+
+    private List<Vector3> ResolveMarkerWorldPositions(List<Vector2> markerPixels)
+    {
+        List<Vector3> markerWorldPositions = new List<Vector3>();
+#if ENABLE_WINMD_SUPPORT
+        if (researchMode == null || markerPixels == null) return markerWorldPositions;
+
+        ushort[] depthFrame = researchMode.GetRawDepthImageBuffer();
+        if (depthFrame == null || depthFrame.Length < SensorImagePixelCount) return markerWorldPositions;
+
+        foreach (var markerPixel in markerPixels)
+        {
+            int pixelX = Mathf.Clamp(Mathf.RoundToInt(markerPixel.x), 0, SensorImageWidth - 1);
+            int pixelY = Mathf.Clamp(Mathf.RoundToInt(markerPixel.y), 0, SensorImageHeight - 1);
+            ushort depthValue = depthFrame[pixelY * SensorImageWidth + pixelX];
+            if (depthValue == 0) continue;
+
+            double[] worldCoordinate = researchMode.GetDepthPixelWorldCoordinate(markerPixel.x, markerPixel.y, depthValue);
+            if (worldCoordinate == null || worldCoordinate.Length < 3) continue;
+
+            markerWorldPositions.Add(new Vector3(
+                (float)worldCoordinate[0],
+                (float)worldCoordinate[1],
+                -(float)worldCoordinate[2]));
+        }
+#endif
+        return markerWorldPositions;
+    }
+
+    private void ReplaceMarkerWorldSpheres(List<Vector3> markerWorldPositions)
+    {
+        foreach (var sphere in markerWorldSpheres)
+        {
+            if (sphere != null) Destroy(sphere);
+        }
+
+        markerWorldSpheres.Clear();
+
+        foreach (var position in markerWorldPositions)
+        {
+            GameObject markerSphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+            markerSphere.name = "DetectedIRMarker";
+            markerSphere.transform.position = position;
+            markerSphere.transform.localScale = Vector3.one * MarkerSphereDiameterMetres;
+
+            Collider collider = markerSphere.GetComponent<Collider>();
+            if (collider != null) Destroy(collider);
+
+            Renderer renderer = markerSphere.GetComponent<Renderer>();
+            if (renderer != null) renderer.material = GetMarkerSphereMaterial();
+
+            markerWorldSpheres.Add(markerSphere);
+        }
+    }
+
+    private Material GetMarkerSphereMaterial()
+    {
+        if (markerSphereMaterial != null) return markerSphereMaterial;
+
+        markerSphereMaterial = new Material(Shader.Find("Standard"));
+        markerSphereMaterial.color = new Color(1f, 0f, 0f, 0.45f);
+        markerSphereMaterial.SetFloat("_Mode", 3f);
+        markerSphereMaterial.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
+        markerSphereMaterial.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
+        markerSphereMaterial.SetInt("_ZWrite", 0);
+        markerSphereMaterial.DisableKeyword("_ALPHATEST_ON");
+        markerSphereMaterial.EnableKeyword("_ALPHABLEND_ON");
+        markerSphereMaterial.DisableKeyword("_ALPHAPREMULTIPLY_ON");
+        markerSphereMaterial.renderQueue = 3000;
+        return markerSphereMaterial;
     }
 
     /// <summary>
@@ -552,6 +778,7 @@ public class ResearchModeController : MonoBehaviour
         GrabLatestSensorImages();
         GrabLatestToolDictionary();
 #endif
+        ApplyLatestMarkerPixels();
         ApplySensorTcpStatusToScreen();
     }
 
@@ -622,6 +849,7 @@ public class ResearchModeController : MonoBehaviour
     private void OnDestroy()
     {
         StopSensorTcpThread();
+        StopMarkerTcpThread();
     }
 
     /// <summary>
@@ -672,4 +900,5 @@ public class ResearchModeController : MonoBehaviour
         public ulong Sequence;
         public double TimestampUnixSeconds;
     }
+
 }

@@ -18,6 +18,12 @@ using System.Linq;
 
 public class UnityToolManager : MonoBehaviour
 {
+    private static readonly HashSet<string> BuiltInToolModelNames = new HashSet<string>
+    {
+        "DinoStylus",
+        "TriangleFrame"
+    };
+
     /// <summary>
     /// Axis to flip when converting from right-handed (HL2 Research Mode) to left-handed (Unity). This needs to be 
     /// universally consistent everywhere you pass info in and out of Unity. So all right-handed information flowing
@@ -57,6 +63,7 @@ public class UnityToolManager : MonoBehaviour
     {
         ScriptTimer.Start();
         InitialiseToolDictionary();
+        HideBuiltInToolModels();
     }
 
     void InitialiseToolDictionary()
@@ -69,6 +76,38 @@ public class UnityToolManager : MonoBehaviour
 
         // 18 elements per tool (2 informational bits + 16 doubles for the transform matrix)
         LatestDoubleArray = new double[ToolDictionary.Count * 18];
+    }
+
+    void HideBuiltInToolModels()
+    {
+        foreach (var tool in ToolsTrackedByHololens)
+        {
+            if (tool.ToolUnityTransform == null) continue;
+
+            Renderer[] renderers = tool.ToolUnityTransform.GetComponentsInChildren<Renderer>(true);
+            foreach (var renderer in renderers)
+            {
+                if (IsBuiltInToolModelRenderer(renderer.transform))
+                {
+                    renderer.enabled = false;
+                }
+            }
+        }
+    }
+
+    private static bool IsBuiltInToolModelRenderer(Transform transform)
+    {
+        while (transform != null)
+        {
+            if (BuiltInToolModelNames.Contains(transform.name))
+            {
+                return true;
+            }
+
+            transform = transform.parent;
+        }
+
+        return false;
     }
 
     // Update is called once per frame

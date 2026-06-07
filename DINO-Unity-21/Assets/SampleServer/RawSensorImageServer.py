@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import pickle
 import queue
 import signal
@@ -14,6 +15,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from ir_yolo_tracker import IRMarkerTracker, MarkerDetection, create_tracker, draw_detections
 from simple_tcp_server import SimpleTcpServer
 
 
@@ -22,6 +24,8 @@ PORT = 8888
 WIDTH = 512
 HEIGHT = 512
 PIXEL_COUNT = WIDTH * HEIGHT
+RAW_STREAM_PREFIX = b"raw_stream:"
+IR_MARKERS_PREFIX = b"ir_markers:"
 MAGIC = b"DINOIMG1"
 HEADER_STRUCT = struct.Struct("<8siiQdii")
 DEPTH_MIN_MM = 1
@@ -43,12 +47,14 @@ class SensorFrame:
     sequence: int
     client_timestamp: float
     received_timestamp: float
+    marker_detections: list[MarkerDetection] = field(default_factory=list)
 
 
 @dataclass
 class SharedState:
     lock: threading.Condition = field(default_factory=threading.Condition)
     latest_frame: SensorFrame | None = None
+    latest_marker_centers: list[list[float]] = field(default_factory=list)
     receive_fps: float = 0.0
     last_error: str = ""
 
@@ -180,6 +186,7 @@ def copy_sensor_frame(frame: SensorFrame) -> SensorFrame:
         sequence=frame.sequence,
         client_timestamp=frame.client_timestamp,
         received_timestamp=frame.received_timestamp,
+        marker_detections=list(frame.marker_detections),
     )
 
 
@@ -207,6 +214,28 @@ def parse_sensor_images(message: bytes) -> tuple[np.ndarray, np.ndarray, int, fl
     infrared = np.frombuffer(message, dtype="<u2", count=infrared_count, offset=offset).reshape((height, width))
 
     return depth, infrared, sequence, client_timestamp
+
+
+def unwrap_raw_stream_request(message: bytes) -> bytes:
+    if not message.startswith(RAW_STREAM_PREFIX):
+        raise ValueError("Unsupported request prefix")
+
+    return message[len(RAW_STREAM_PREFIX):]
+
+
+def detect_infrared_markers(infrared: np.ndarray, marker_tracker: IRMarkerTracker) -> list[MarkerDetection]:
+    return marker_tracker.detect(infrared)
+
+
+def marker_detection_centers(detections: list[MarkerDetection]) -> list[list[float]]:
+    return [[float(x), float(y)] for x, y in (detection.center_xy for detection in detections)]
+
+
+def serialize_latest_marker_centers(state: SharedState) -> bytes:
+    with state.lock:
+        marker_centers = [center[:] for center in state.latest_marker_centers]
+
+    return json.dumps(marker_centers, separators=(",", ":")).encode("utf-8")
 
 
 def normalize_depth_for_display(depth: np.ndarray) -> np.ndarray:
@@ -238,6 +267,7 @@ def draw_text(image: np.ndarray, lines: list[str]) -> None:
 def render_frame(frame: SensorFrame, receive_fps: float) -> np.ndarray:
     depth_display = cv2.cvtColor(normalize_depth_for_display(frame.depth), cv2.COLOR_GRAY2BGR)
     infrared_display = cv2.cvtColor(normalize_min_max_for_display(frame.infrared), cv2.COLOR_GRAY2BGR)
+    infrared_display = draw_detections(infrared_display, frame.marker_detections)
 
     received_text = datetime.fromtimestamp(frame.received_timestamp).strftime("%H:%M:%S.%f")[:-3]
     draw_text(
@@ -252,6 +282,7 @@ def render_frame(frame: SensorFrame, receive_fps: float) -> np.ndarray:
         infrared_display,
         [
             "Infrared 16-bit",
+            f"Markers {len(frame.marker_detections)}",
             f"Received {received_text}",
             f"Client TS {frame.client_timestamp:.3f}",
         ],
@@ -274,13 +305,23 @@ def publish_sensor_frame(
     state: SharedState,
     fps_counter: FpsCounter,
     image_writer: AsyncRawImagePickleWriter | None = None,
+    marker_detections: list[MarkerDetection] | None = None,
 ) -> tuple[SensorFrame, float]:
     received_timestamp = time.time()
     receive_fps = fps_counter.tick(time.perf_counter())
-    frame = SensorFrame(depth, infrared, sequence, client_timestamp, received_timestamp)
+    marker_centers = marker_detection_centers(marker_detections or [])
+    frame = SensorFrame(
+        depth,
+        infrared,
+        sequence,
+        client_timestamp,
+        received_timestamp,
+        marker_detections=marker_detections or [],
+    )
 
     with state.lock:
         state.latest_frame = frame
+        state.latest_marker_centers = marker_centers
         state.receive_fps = receive_fps
         state.last_error = ""
         state.lock.notify_all()
@@ -295,12 +336,18 @@ def process_message(
     message: bytes,
     state: SharedState,
     fps_counter: FpsCounter,
+    marker_tracker: IRMarkerTracker,
     image_writer: AsyncRawImagePickleWriter | None = None,
 ) -> bytes:
     if message == b"quit":
         return b"quit"
 
-    depth, infrared, sequence, client_timestamp = parse_sensor_images(message)
+    if message.startswith(IR_MARKERS_PREFIX):
+        return serialize_latest_marker_centers(state)
+
+    raw_stream_message = unwrap_raw_stream_request(message)
+    depth, infrared, sequence, client_timestamp = parse_sensor_images(raw_stream_message)
+    marker_detections = detect_infrared_markers(infrared, marker_tracker)
     frame, receive_fps = publish_sensor_frame(
         depth,
         infrared,
@@ -309,12 +356,14 @@ def process_message(
         state,
         fps_counter,
         image_writer=image_writer,
+        marker_detections=marker_detections,
     )
     received = datetime.fromtimestamp(frame.received_timestamp)
     print(
         f"[{received:%Y-%m-%d %H:%M:%S.%f}] "
         f"frame={frame.sequence} client_ts={frame.client_timestamp:.6f} "
-        f"rx_fps={receive_fps:.2f} depth_shape={frame.depth.shape} infrared_shape={frame.infrared.shape}",
+        f"rx_fps={receive_fps:.2f} markers={len(frame.marker_detections)} "
+        f"depth_shape={frame.depth.shape} infrared_shape={frame.infrared.shape}",
         flush=True,
     )
 
@@ -343,6 +392,7 @@ class RawSensorImageReceiver:
         self.server: RawSensorTcpServer | None = None
         self.fps_counter = FpsCounter()
         self.image_writer = AsyncRawImagePickleWriter(self.image_output_dir) if save_raw_images else None
+        self.marker_tracker = create_tracker()
 
     def start(self) -> None:
         if self.server_thread is not None and self.server_thread.is_alive():
@@ -446,10 +496,21 @@ class RawSensorImageReceiver:
             return b"ok"
 
         try:
-            if self.print_frame_log:
-                return process_message(message, self.state, self.fps_counter, image_writer=self.image_writer)
+            if message.startswith(IR_MARKERS_PREFIX):
+                return serialize_latest_marker_centers(self.state)
 
-            depth, infrared, sequence, client_timestamp = parse_sensor_images(message)
+            if self.print_frame_log:
+                return process_message(
+                    message,
+                    self.state,
+                    self.fps_counter,
+                    self.marker_tracker,
+                    image_writer=self.image_writer,
+                )
+
+            raw_stream_message = unwrap_raw_stream_request(message)
+            depth, infrared, sequence, client_timestamp = parse_sensor_images(raw_stream_message)
+            marker_detections = detect_infrared_markers(infrared, self.marker_tracker)
             publish_sensor_frame(
                 depth,
                 infrared,
@@ -458,6 +519,7 @@ class RawSensorImageReceiver:
                 self.state,
                 self.fps_counter,
                 image_writer=self.image_writer,
+                marker_detections=marker_detections,
             )
 
             return b"ok"
