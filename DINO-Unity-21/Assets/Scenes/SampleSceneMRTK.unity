@@ -1862,7 +1862,7 @@ MonoBehaviour:
   streamRawSensorImagesOverTcp: 1
   sensorTcpHost: 169.254.83.86
   sensorTcpPort: 8888
-  sensorTcpFrameIntervalSeconds: 0.033333335
+  sensorTcpFrameIntervalSeconds: 0.01
   sensorTcpReconnectIntervalSeconds: 1
   ToolManagerScript: {fileID: 1127487041}
   JSONFilename: DinoToolsConfigMilli.json

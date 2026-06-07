@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import argparse
+import pickle
+import queue
 import signal
 import struct
 import threading
@@ -7,6 +10,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -25,6 +29,11 @@ DEPTH_MAX_MM = 4090
 WINDOW_NAME = "DINO Raw Sensor Stream"
 SHUTDOWN_MESSAGE = "Shutdown requested. Closing raw sensor server..."
 VISUALIZATION_INTERVAL_SECONDS = 1.0 / 30.0
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+IR_DATA_DIR = PROJECT_ROOT / "IRData"
+SAVE_RAW_IMAGES_TO_PICKLE = False
+DEPTH_SAVE_DIR_NAME = "depth"
+INFRARED_SAVE_DIR_NAME = "infrared"
 
 
 @dataclass
@@ -74,6 +83,94 @@ class FpsCounter:
             return 0.0
 
         return (len(self.samples) - 1) / elapsed
+
+
+@dataclass(frozen=True)
+class RawImageSaveTask:
+    path: Path
+    image: np.ndarray
+
+
+class AsyncRawImagePickleWriter:
+    def __init__(self, output_dir: Path | str = IR_DATA_DIR) -> None:
+        self.output_dir = Path(output_dir)
+        self.depth_dir = self.output_dir / DEPTH_SAVE_DIR_NAME
+        self.infrared_dir = self.output_dir / INFRARED_SAVE_DIR_NAME
+        self.tasks: queue.Queue[RawImageSaveTask | None] = queue.Queue()
+        self.counter_lock = threading.Lock()
+        self.next_frame_number = 1
+        self.thread: threading.Thread | None = None
+        self.last_error = ""
+
+    def start(self) -> None:
+        if self.thread is not None and self.thread.is_alive():
+            return
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.depth_dir.mkdir(parents=True, exist_ok=True)
+        self.infrared_dir.mkdir(parents=True, exist_ok=True)
+        self.next_frame_number = self._discover_next_frame_number()
+        self.tasks = queue.Queue()
+        self.last_error = ""
+        self.thread = threading.Thread(target=self._worker_loop, name="RawImagePickleWriter", daemon=True)
+        self.thread.start()
+        print(f"Raw image pickle saving enabled: {self.output_dir}", flush=True)
+
+    def stop(self, join_timeout: float | None = None) -> None:
+        if self.thread is None:
+            return
+
+        self.tasks.put_nowait(None)
+        self.thread.join(timeout=join_timeout)
+        if self.thread.is_alive():
+            print("Raw image pickle writer is still flushing queued images.", flush=True)
+            return
+
+        self.thread = None
+
+    def submit_frame(self, frame: SensorFrame) -> int | None:
+        if self.thread is None or not self.thread.is_alive():
+            return None
+
+        with self.counter_lock:
+            frame_number = self.next_frame_number
+            self.next_frame_number += 1
+
+        filename = f"{frame_number:07d}.pickle"
+        self.tasks.put_nowait(RawImageSaveTask(self.depth_dir / filename, frame.depth))
+        self.tasks.put_nowait(RawImageSaveTask(self.infrared_dir / filename, frame.infrared))
+        return frame_number
+
+    def _discover_next_frame_number(self) -> int:
+        max_frame_number = 0
+        for directory in (self.depth_dir, self.infrared_dir):
+            if not directory.exists():
+                continue
+
+            for path in directory.glob("*.pickle"):
+                if path.stem.isdecimal():
+                    max_frame_number = max(max_frame_number, int(path.stem))
+
+        return max_frame_number + 1
+
+    def _worker_loop(self) -> None:
+        while True:
+            task = self.tasks.get()
+            try:
+                if task is None:
+                    return
+
+                image = np.asarray(task.image, dtype=np.uint16)
+                if image.shape != (HEIGHT, WIDTH):
+                    raise ValueError(f"Unexpected image shape for {task.path}: {image.shape}")
+
+                with task.path.open("wb") as file:
+                    pickle.dump(image, file, protocol=pickle.HIGHEST_PROTOCOL)
+            except Exception as exc:
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                print(f"Raw image pickle save error: {self.last_error}", flush=True)
+            finally:
+                self.tasks.task_done()
 
 
 def copy_sensor_frame(frame: SensorFrame) -> SensorFrame:
@@ -169,11 +266,15 @@ def render_waiting_frame(message: str) -> np.ndarray:
     return image
 
 
-def process_message(message: bytes, state: SharedState, fps_counter: FpsCounter) -> bytes:
-    if message == b"quit":
-        return b"quit"
-
-    depth, infrared, sequence, client_timestamp = parse_sensor_images(message)
+def publish_sensor_frame(
+    depth: np.ndarray,
+    infrared: np.ndarray,
+    sequence: int,
+    client_timestamp: float,
+    state: SharedState,
+    fps_counter: FpsCounter,
+    image_writer: AsyncRawImagePickleWriter | None = None,
+) -> tuple[SensorFrame, float]:
     received_timestamp = time.time()
     receive_fps = fps_counter.tick(time.perf_counter())
     frame = SensorFrame(depth, infrared, sequence, client_timestamp, received_timestamp)
@@ -184,11 +285,36 @@ def process_message(message: bytes, state: SharedState, fps_counter: FpsCounter)
         state.last_error = ""
         state.lock.notify_all()
 
-    received = datetime.fromtimestamp(received_timestamp)
+    if image_writer is not None:
+        image_writer.submit_frame(frame)
+
+    return frame, receive_fps
+
+
+def process_message(
+    message: bytes,
+    state: SharedState,
+    fps_counter: FpsCounter,
+    image_writer: AsyncRawImagePickleWriter | None = None,
+) -> bytes:
+    if message == b"quit":
+        return b"quit"
+
+    depth, infrared, sequence, client_timestamp = parse_sensor_images(message)
+    frame, receive_fps = publish_sensor_frame(
+        depth,
+        infrared,
+        sequence,
+        client_timestamp,
+        state,
+        fps_counter,
+        image_writer=image_writer,
+    )
+    received = datetime.fromtimestamp(frame.received_timestamp)
     print(
         f"[{received:%Y-%m-%d %H:%M:%S.%f}] "
-        f"frame={sequence} client_ts={client_timestamp:.6f} "
-        f"rx_fps={receive_fps:.2f} depth_shape={depth.shape} infrared_shape={infrared.shape}",
+        f"frame={frame.sequence} client_ts={frame.client_timestamp:.6f} "
+        f"rx_fps={receive_fps:.2f} depth_shape={frame.depth.shape} infrared_shape={frame.infrared.shape}",
         flush=True,
     )
 
@@ -202,22 +328,29 @@ class RawSensorImageReceiver:
         port: int = PORT,
         client_timeout: float = 3600.0,
         print_frame_log: bool = True,
+        save_raw_images: bool = SAVE_RAW_IMAGES_TO_PICKLE,
+        image_output_dir: Path | str = IR_DATA_DIR,
     ) -> None:
         self.host = host
         self.port = port
         self.client_timeout = client_timeout
         self.print_frame_log = print_frame_log
+        self.save_raw_images = save_raw_images
+        self.image_output_dir = Path(image_output_dir)
         self.state = SharedState()
         self.stop_event = threading.Event()
         self.server_thread: threading.Thread | None = None
         self.server: RawSensorTcpServer | None = None
         self.fps_counter = FpsCounter()
+        self.image_writer = AsyncRawImagePickleWriter(self.image_output_dir) if save_raw_images else None
 
     def start(self) -> None:
         if self.server_thread is not None and self.server_thread.is_alive():
             return
 
         self.stop_event.clear()
+        if self.image_writer is not None:
+            self.image_writer.start()
         self.server_thread = threading.Thread(target=self._server_loop, name="RawSensorTcpServer", daemon=True)
         self.server_thread.start()
 
@@ -229,6 +362,9 @@ class RawSensorImageReceiver:
         if self.server_thread is not None:
             self.server_thread.join(timeout=join_timeout)
             self.server_thread = None
+
+        if self.image_writer is not None:
+            self.image_writer.stop()
 
     def get_current_frame(self, copy: bool = True) -> SensorFrame | None:
         with self.state.lock:
@@ -311,17 +447,18 @@ class RawSensorImageReceiver:
 
         try:
             if self.print_frame_log:
-                return process_message(message, self.state, self.fps_counter)
+                return process_message(message, self.state, self.fps_counter, image_writer=self.image_writer)
 
             depth, infrared, sequence, client_timestamp = parse_sensor_images(message)
-            received_timestamp = time.time()
-            receive_fps = self.fps_counter.tick(time.perf_counter())
-            frame = SensorFrame(depth, infrared, sequence, client_timestamp, received_timestamp)
-            with self.state.lock:
-                self.state.latest_frame = frame
-                self.state.receive_fps = receive_fps
-                self.state.last_error = ""
-                self.state.lock.notify_all()
+            publish_sensor_frame(
+                depth,
+                infrared,
+                sequence,
+                client_timestamp,
+                self.state,
+                self.fps_counter,
+                image_writer=self.image_writer,
+            )
 
             return b"ok"
         except Exception as exc:
@@ -362,7 +499,14 @@ def server_loop(state: SharedState, stop_event: threading.Event) -> None:
     receiver = RawSensorImageReceiver()
     receiver.state = state
     receiver.stop_event = stop_event
-    receiver._server_loop()
+    if receiver.image_writer is not None:
+        receiver.image_writer.start()
+
+    try:
+        receiver._server_loop()
+    finally:
+        if receiver.image_writer is not None:
+            receiver.image_writer.stop()
 
 
 def visualization_loop(state: SharedState, stop_event: threading.Event) -> None:
@@ -411,10 +555,18 @@ def start_receiver(
     port: int = PORT,
     show_visualization: bool = False,
     print_frame_log: bool = True,
+    save_raw_images: bool = SAVE_RAW_IMAGES_TO_PICKLE,
+    image_output_dir: Path | str = IR_DATA_DIR,
 ) -> RawSensorImageReceiver:
     global _default_receiver
 
-    receiver = RawSensorImageReceiver(host=host, port=port, print_frame_log=print_frame_log)
+    receiver = RawSensorImageReceiver(
+        host=host,
+        port=port,
+        print_frame_log=print_frame_log,
+        save_raw_images=save_raw_images,
+        image_output_dir=image_output_dir,
+    )
     receiver.start()
     _default_receiver = receiver
 
@@ -467,8 +619,32 @@ def wait_for_next_images(timeout: float | None = None, copy: bool = True) -> tup
     return _default_receiver.wait_for_next_images(timeout=timeout, copy=copy)
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Receive HoloLens 2 raw depth and infrared images over TCP.")
+    parser.add_argument("--host", default=HOST, help=f"TCP host/IP to bind. Default: {HOST}")
+    parser.add_argument("--port", type=int, default=PORT, help=f"TCP port to bind. Default: {PORT}")
+    parser.add_argument(
+        "--save-raw-images",
+        action="store_true",
+        default=SAVE_RAW_IMAGES_TO_PICKLE,
+        help=f"Save every depth and infrared frame as pickle files under {IR_DATA_DIR}.",
+    )
+    parser.add_argument(
+        "--image-output-dir",
+        default=str(IR_DATA_DIR),
+        help=f"Directory for saved pickle files. Default: {IR_DATA_DIR}",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
-    receiver = RawSensorImageReceiver()
+    args = parse_args()
+    receiver = RawSensorImageReceiver(
+        host=args.host,
+        port=args.port,
+        save_raw_images=args.save_raw_images,
+        image_output_dir=args.image_output_dir,
+    )
 
     def request_shutdown(signum: int, frame: object) -> None:
         print(SHUTDOWN_MESSAGE, flush=True)
