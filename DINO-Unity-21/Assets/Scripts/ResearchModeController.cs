@@ -71,9 +71,11 @@ public class ResearchModeController : MonoBehaviour
     private const float SensorImageUploadIntervalSeconds = 1f / 30f;
     private static readonly byte[] SensorTcpRawStreamPrefix = Encoding.ASCII.GetBytes("raw_stream:");
     private static readonly byte[] SensorTcpIrMarkersRequest = Encoding.ASCII.GetBytes("ir_markers:");
+    private static readonly byte[] SensorTcpReal3DCoordPrefix = Encoding.ASCII.GetBytes("real_3d_coord:");
     private static readonly byte[] SensorTcpPayloadMagic = Encoding.ASCII.GetBytes("DINOIMG1");
     private const float MarkerPollingIntervalSeconds = 1f / 15f;
     private const float MarkerSphereDiameterMetres = 0.01f;
+    private const float MarkerSphereRadiusMetres = MarkerSphereDiameterMetres * 0.5f;
 
     private static readonly int SourceChannelId = Shader.PropertyToID("_SourceChannel");
     private static readonly int InputMaxValueId = Shader.PropertyToID("_InputMaxValue");
@@ -102,6 +104,9 @@ public class ResearchModeController : MonoBehaviour
     private readonly object markerPixelsLock = new object();
     private List<Vector2> latestMarkerPixels = new List<Vector2>();
     private bool newMarkerPixelsReceived = false;
+    private readonly object markerWorldCoordinatesUploadLock = new object();
+    private List<Vector3> pendingMarkerWorldCoordinatesUpload = new List<Vector3>();
+    private bool markerWorldCoordinatesUploadPending = false;
     private readonly List<GameObject> markerWorldSpheres = new List<GameObject>();
     private Material markerSphereMaterial = null;
 
@@ -457,6 +462,15 @@ public class ResearchModeController : MonoBehaviour
                 SetSensorTcpStatus($"IR marker response parse failed: {ex.Message}");
             }
 
+            try
+            {
+                UploadPendingMarkerWorldCoordinates();
+            }
+            catch (Exception ex)
+            {
+                SetSensorTcpStatus(ex.Message);
+            }
+
             SleepMarkerTcpThread((int)(MarkerPollingIntervalSeconds * 1000f));
         }
 
@@ -568,6 +582,56 @@ public class ResearchModeController : MonoBehaviour
         return markerPixels;
     }
 
+    private void QueueMarkerWorldCoordinatesUpload(List<Vector3> markerWorldPositions)
+    {
+        lock (markerWorldCoordinatesUploadLock)
+        {
+            pendingMarkerWorldCoordinatesUpload = new List<Vector3>(markerWorldPositions);
+            markerWorldCoordinatesUploadPending = true;
+        }
+    }
+
+    private void UploadPendingMarkerWorldCoordinates()
+    {
+        List<Vector3> markerWorldPositions;
+        lock (markerWorldCoordinatesUploadLock)
+        {
+            if (!markerWorldCoordinatesUploadPending) return;
+
+            markerWorldPositions = new List<Vector3>(pendingMarkerWorldCoordinatesUpload);
+            markerWorldCoordinatesUploadPending = false;
+        }
+
+        byte[] payload = BuildMarkerWorldCoordinatesPayload(markerWorldPositions);
+        byte[] response = markerTcpClient.Request(payload);
+        if (!IsOkSensorTcpResponse(response))
+        {
+            lock (markerWorldCoordinatesUploadLock)
+            {
+                pendingMarkerWorldCoordinatesUpload = markerWorldPositions;
+                markerWorldCoordinatesUploadPending = true;
+            }
+
+            string reason = response == null ? GetSensorTcpErrorReason(markerTcpClient) : Encoding.ASCII.GetString(response);
+            throw new InvalidOperationException($"real_3d_coord upload failed: {reason}");
+        }
+    }
+
+    private static byte[] BuildMarkerWorldCoordinatesPayload(List<Vector3> markerWorldPositions)
+    {
+        JArray coordinatesJson = new JArray();
+        foreach (var position in markerWorldPositions)
+        {
+            coordinatesJson.Add(new JArray(position.x, position.y, position.z));
+        }
+
+        byte[] jsonPayload = Encoding.UTF8.GetBytes(coordinatesJson.ToString(Newtonsoft.Json.Formatting.None));
+        byte[] payload = new byte[SensorTcpReal3DCoordPrefix.Length + jsonPayload.Length];
+        Buffer.BlockCopy(SensorTcpReal3DCoordPrefix, 0, payload, 0, SensorTcpReal3DCoordPrefix.Length);
+        Buffer.BlockCopy(jsonPayload, 0, payload, SensorTcpReal3DCoordPrefix.Length, jsonPayload.Length);
+        return payload;
+    }
+
     private static byte[] BuildRawSensorTcpPayload(RawSensorTcpFrame frame, ref byte[] payload)
     {
         int depthByteLength = SensorImagePixelCount * sizeof(ushort);
@@ -642,6 +706,7 @@ public class ResearchModeController : MonoBehaviour
         }
 
         List<Vector3> markerWorldPositions = ResolveMarkerWorldPositions(markerPixels);
+        QueueMarkerWorldCoordinatesUpload(markerWorldPositions);
         ReplaceMarkerWorldSpheres(markerWorldPositions);
     }
 
@@ -664,13 +729,26 @@ public class ResearchModeController : MonoBehaviour
             double[] worldCoordinate = researchMode.GetDepthPixelWorldCoordinate(markerPixel.x, markerPixel.y, depthValue);
             if (worldCoordinate == null || worldCoordinate.Length < 3) continue;
 
-            markerWorldPositions.Add(new Vector3(
+            Vector3 markerSurfacePosition = new Vector3(
                 (float)worldCoordinate[0],
                 (float)worldCoordinate[1],
-                -(float)worldCoordinate[2]));
+                -(float)worldCoordinate[2]);
+
+            markerWorldPositions.Add(OffsetMarkerSurfacePointToCenter(markerSurfacePosition));
         }
 #endif
         return markerWorldPositions;
+    }
+
+    private static Vector3 OffsetMarkerSurfacePointToCenter(Vector3 markerSurfacePosition)
+    {
+        Camera mainCamera = Camera.main;
+        if (mainCamera == null) return markerSurfacePosition;
+
+        Vector3 outwardDirection = markerSurfacePosition - mainCamera.transform.position;
+        if (outwardDirection.sqrMagnitude <= Mathf.Epsilon) return markerSurfacePosition;
+
+        return markerSurfacePosition + outwardDirection.normalized * MarkerSphereRadiusMetres;
     }
 
     private void ReplaceMarkerWorldSpheres(List<Vector3> markerWorldPositions)

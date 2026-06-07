@@ -87,7 +87,7 @@ public class UnityToolManager : MonoBehaviour
             Renderer[] renderers = tool.ToolUnityTransform.GetComponentsInChildren<Renderer>(true);
             foreach (var renderer in renderers)
             {
-                if (IsBuiltInToolModelRenderer(renderer.transform))
+                if (IsHiddenToolRenderer(renderer.transform))
                 {
                     renderer.enabled = false;
                 }
@@ -95,11 +95,11 @@ public class UnityToolManager : MonoBehaviour
         }
     }
 
-    private static bool IsBuiltInToolModelRenderer(Transform transform)
+    private static bool IsHiddenToolRenderer(Transform transform)
     {
         while (transform != null)
         {
-            if (BuiltInToolModelNames.Contains(transform.name))
+            if (BuiltInToolModelNames.Contains(transform.name) || transform.name == "tracker")
             {
                 return true;
             }

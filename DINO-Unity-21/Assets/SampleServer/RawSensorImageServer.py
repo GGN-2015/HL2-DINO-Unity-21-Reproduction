@@ -26,6 +26,7 @@ HEIGHT = 512
 PIXEL_COUNT = WIDTH * HEIGHT
 RAW_STREAM_PREFIX = b"raw_stream:"
 IR_MARKERS_PREFIX = b"ir_markers:"
+REAL_3D_COORD_PREFIX = b"real_3d_coord:"
 MAGIC = b"DINOIMG1"
 HEADER_STRUCT = struct.Struct("<8siiQdii")
 DEPTH_MIN_MM = 1
@@ -51,10 +52,28 @@ class SensorFrame:
 
 
 @dataclass
+class ThreadSafeCoordinateStore:
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    coordinates: list[list[float]] = field(default_factory=list)
+    updated_timestamp: float | None = None
+
+    def set_coordinates(self, coordinates: list[list[float]]) -> None:
+        copied_coordinates = [coordinate[:] for coordinate in coordinates]
+        with self.lock:
+            self.coordinates = copied_coordinates
+            self.updated_timestamp = time.time()
+
+    def get_coordinates(self) -> list[list[float]]:
+        with self.lock:
+            return [coordinate[:] for coordinate in self.coordinates]
+
+
+@dataclass
 class SharedState:
     lock: threading.Condition = field(default_factory=threading.Condition)
     latest_frame: SensorFrame | None = None
     latest_marker_centers: list[list[float]] = field(default_factory=list)
+    latest_hololens_marker_world_coordinates: ThreadSafeCoordinateStore = field(default_factory=ThreadSafeCoordinateStore)
     receive_fps: float = 0.0
     last_error: str = ""
 
@@ -238,6 +257,34 @@ def serialize_latest_marker_centers(state: SharedState) -> bytes:
     return json.dumps(marker_centers, separators=(",", ":")).encode("utf-8")
 
 
+def parse_real_3d_coordinates(message: bytes) -> list[list[float]]:
+    if not message.startswith(REAL_3D_COORD_PREFIX):
+        raise ValueError("Unsupported request prefix")
+
+    payload = message[len(REAL_3D_COORD_PREFIX):]
+    if not payload:
+        return []
+
+    decoded_payload = json.loads(payload.decode("utf-8"))
+    if not isinstance(decoded_payload, list):
+        raise ValueError("real_3d_coord payload must be a JSON list")
+
+    coordinates: list[list[float]] = []
+    for coordinate in decoded_payload:
+        if not isinstance(coordinate, list) or len(coordinate) < 3:
+            raise ValueError("Each real_3d_coord entry must be a list with at least 3 values")
+
+        coordinates.append([float(coordinate[0]), float(coordinate[1]), float(coordinate[2])])
+
+    return coordinates
+
+
+def store_real_3d_coordinates(message: bytes, state: SharedState) -> bytes:
+    coordinates = parse_real_3d_coordinates(message)
+    state.latest_hololens_marker_world_coordinates.set_coordinates(coordinates)
+    return b"ok"
+
+
 def normalize_depth_for_display(depth: np.ndarray) -> np.ndarray:
     clipped = np.clip(depth, DEPTH_MIN_MM, DEPTH_MAX_MM).astype(np.float32, copy=False)
     normalized = (DEPTH_MAX_MM - clipped) * (255.0 / (DEPTH_MAX_MM - DEPTH_MIN_MM))
@@ -344,6 +391,9 @@ def process_message(
 
     if message.startswith(IR_MARKERS_PREFIX):
         return serialize_latest_marker_centers(state)
+
+    if message.startswith(REAL_3D_COORD_PREFIX):
+        return store_real_3d_coordinates(message, state)
 
     raw_stream_message = unwrap_raw_stream_request(message)
     depth, infrared, sequence, client_timestamp = parse_sensor_images(raw_stream_message)
@@ -490,6 +540,9 @@ class RawSensorImageReceiver:
         with self.state.lock:
             return self.state.last_error
 
+    def get_latest_hololens_marker_world_coordinates(self) -> list[list[float]]:
+        return self.state.latest_hololens_marker_world_coordinates.get_coordinates()
+
     def _raw_sensor_worker(self, message: bytes) -> bytes:
         if message == b"quit":
             self.stop_event.set()
@@ -498,6 +551,9 @@ class RawSensorImageReceiver:
         try:
             if message.startswith(IR_MARKERS_PREFIX):
                 return serialize_latest_marker_centers(self.state)
+
+            if message.startswith(REAL_3D_COORD_PREFIX):
+                return store_real_3d_coordinates(message, self.state)
 
             if self.print_frame_log:
                 return process_message(
@@ -665,6 +721,13 @@ def get_current_images(copy: bool = True) -> tuple[np.ndarray, np.ndarray] | Non
         return None
 
     return _default_receiver.get_current_images(copy=copy)
+
+
+def get_latest_hololens_marker_world_coordinates() -> list[list[float]]:
+    if _default_receiver is None:
+        return []
+
+    return _default_receiver.get_latest_hololens_marker_world_coordinates()
 
 
 def wait_for_images(timeout: float | None = None, copy: bool = True) -> tuple[np.ndarray, np.ndarray] | None:
