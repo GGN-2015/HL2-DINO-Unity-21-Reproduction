@@ -26,11 +26,16 @@ HEIGHT = 512
 PIXEL_COUNT = WIDTH * HEIGHT
 RAW_STREAM_PREFIX = b"raw_stream:"
 IR_MARKERS_PREFIX = b"ir_markers:"
+IR_MARKER_RAYS_PREFIX = b"ir_marker_rays:"
 REAL_3D_COORD_PREFIX = b"real_3d_coord:"
-MAGIC = b"DINOIMG1"
-HEADER_STRUCT = struct.Struct("<8siiQdii")
+MAGIC_V1 = b"DINOIMG1"
+MAGIC_V2 = b"DINOIMG2"
+HEADER_V1_STRUCT = struct.Struct("<8siiQdii")
+HEADER_V2_STRUCT = struct.Struct("<8siiQdiii")
+DEPTH_TO_WORLD_MATRIX_VALUES = 16
 DEPTH_MIN_MM = 1
 DEPTH_MAX_MM = 4090
+MARKER_SPHERE_RADIUS_METRES = 0.005
 WINDOW_NAME = "DINO Raw Sensor Stream"
 SHUTDOWN_MESSAGE = "Shutdown requested. Closing raw sensor server..."
 VISUALIZATION_INTERVAL_SECONDS = 1.0 / 30.0
@@ -48,6 +53,7 @@ class SensorFrame:
     sequence: int
     client_timestamp: float
     received_timestamp: float
+    depth_to_world_matrix: np.ndarray | None = None
     marker_detections: list[MarkerDetection] = field(default_factory=list)
 
 
@@ -72,6 +78,7 @@ class ThreadSafeCoordinateStore:
 class SharedState:
     lock: threading.Condition = field(default_factory=threading.Condition)
     latest_frame: SensorFrame | None = None
+    latest_marker_query_frame: SensorFrame | None = None
     latest_marker_centers: list[list[float]] = field(default_factory=list)
     latest_hololens_marker_world_coordinates: ThreadSafeCoordinateStore = field(default_factory=ThreadSafeCoordinateStore)
     receive_fps: float = 0.0
@@ -205,16 +212,27 @@ def copy_sensor_frame(frame: SensorFrame) -> SensorFrame:
         sequence=frame.sequence,
         client_timestamp=frame.client_timestamp,
         received_timestamp=frame.received_timestamp,
+        depth_to_world_matrix=None if frame.depth_to_world_matrix is None else frame.depth_to_world_matrix.copy(),
         marker_detections=list(frame.marker_detections),
     )
 
 
-def parse_sensor_images(message: bytes) -> tuple[np.ndarray, np.ndarray, int, float]:
-    if len(message) < HEADER_STRUCT.size:
+def parse_sensor_images(message: bytes) -> tuple[np.ndarray, np.ndarray, int, float, np.ndarray | None]:
+    if len(message) < HEADER_V1_STRUCT.size:
         raise ValueError(f"Message is too short: {len(message)} bytes")
 
-    magic, width, height, sequence, client_timestamp, depth_count, infrared_count = HEADER_STRUCT.unpack_from(message, 0)
-    if magic != MAGIC:
+    magic = message[:8]
+    if magic == MAGIC_V1:
+        return parse_sensor_images_v1(message)
+    if magic == MAGIC_V2:
+        return parse_sensor_images_v2(message)
+
+    raise ValueError(f"Bad packet magic: {magic!r}")
+
+
+def parse_sensor_images_v1(message: bytes) -> tuple[np.ndarray, np.ndarray, int, float, np.ndarray | None]:
+    magic, width, height, sequence, client_timestamp, depth_count, infrared_count = HEADER_V1_STRUCT.unpack_from(message, 0)
+    if magic != MAGIC_V1:
         raise ValueError(f"Bad packet magic: {magic!r}")
     if width != WIDTH or height != HEIGHT:
         raise ValueError(f"Unexpected image size: {width}x{height}")
@@ -223,16 +241,55 @@ def parse_sensor_images(message: bytes) -> tuple[np.ndarray, np.ndarray, int, fl
 
     depth_bytes = depth_count * np.dtype(np.uint16).itemsize
     infrared_bytes = infrared_count * np.dtype(np.uint16).itemsize
-    expected_size = HEADER_STRUCT.size + depth_bytes + infrared_bytes
+    expected_size = HEADER_V1_STRUCT.size + depth_bytes + infrared_bytes
     if len(message) != expected_size:
         raise ValueError(f"Unexpected packet size: got {len(message)}, expected {expected_size}")
 
-    offset = HEADER_STRUCT.size
+    offset = HEADER_V1_STRUCT.size
     depth = np.frombuffer(message, dtype="<u2", count=depth_count, offset=offset).reshape((height, width))
     offset += depth_bytes
     infrared = np.frombuffer(message, dtype="<u2", count=infrared_count, offset=offset).reshape((height, width))
 
-    return depth, infrared, sequence, client_timestamp
+    return depth, infrared, sequence, client_timestamp, None
+
+
+def parse_sensor_images_v2(message: bytes) -> tuple[np.ndarray, np.ndarray, int, float, np.ndarray]:
+    (
+        magic,
+        width,
+        height,
+        sequence,
+        client_timestamp,
+        depth_count,
+        infrared_count,
+        matrix_count,
+    ) = HEADER_V2_STRUCT.unpack_from(message, 0)
+    if magic != MAGIC_V2:
+        raise ValueError(f"Bad packet magic: {magic!r}")
+    if width != WIDTH or height != HEIGHT:
+        raise ValueError(f"Unexpected image size: {width}x{height}")
+    if depth_count != PIXEL_COUNT or infrared_count != PIXEL_COUNT:
+        raise ValueError(f"Unexpected pixel counts: depth={depth_count}, infrared={infrared_count}")
+    if matrix_count != DEPTH_TO_WORLD_MATRIX_VALUES:
+        raise ValueError(f"Unexpected depth-to-world matrix value count: {matrix_count}")
+
+    matrix_bytes = matrix_count * np.dtype(np.float64).itemsize
+    depth_bytes = depth_count * np.dtype(np.uint16).itemsize
+    infrared_bytes = infrared_count * np.dtype(np.uint16).itemsize
+    expected_size = HEADER_V2_STRUCT.size + matrix_bytes + depth_bytes + infrared_bytes
+    if len(message) != expected_size:
+        raise ValueError(f"Unexpected packet size: got {len(message)}, expected {expected_size}")
+
+    offset = HEADER_V2_STRUCT.size
+    depth_to_world_matrix = np.frombuffer(message, dtype="<f8", count=matrix_count, offset=offset).reshape(
+        (4, 4), order="F"
+    )
+    offset += matrix_bytes
+    depth = np.frombuffer(message, dtype="<u2", count=depth_count, offset=offset).reshape((height, width))
+    offset += depth_bytes
+    infrared = np.frombuffer(message, dtype="<u2", count=infrared_count, offset=offset).reshape((height, width))
+
+    return depth, infrared, sequence, client_timestamp, depth_to_world_matrix
 
 
 def unwrap_raw_stream_request(message: bytes) -> bytes:
@@ -253,8 +310,105 @@ def marker_detection_centers(detections: list[MarkerDetection]) -> list[list[flo
 def serialize_latest_marker_centers(state: SharedState) -> bytes:
     with state.lock:
         marker_centers = [center[:] for center in state.latest_marker_centers]
+        state.latest_marker_query_frame = state.latest_frame
 
     return json.dumps(marker_centers, separators=(",", ":")).encode("utf-8")
+
+
+def parse_marker_camera_rays(message: bytes) -> list[list[float]]:
+    if not message.startswith(IR_MARKER_RAYS_PREFIX):
+        raise ValueError("Unsupported request prefix")
+
+    payload = message[len(IR_MARKER_RAYS_PREFIX):]
+    if not payload:
+        return []
+
+    decoded_payload = json.loads(payload.decode("utf-8"))
+    if not isinstance(decoded_payload, list):
+        raise ValueError("ir_marker_rays payload must be a JSON list")
+
+    rays: list[list[float]] = []
+    for ray in decoded_payload:
+        if not isinstance(ray, list) or len(ray) < 4:
+            raise ValueError("Each ir_marker_rays entry must be [pixel_x, pixel_y, unit_plane_x, unit_plane_y]")
+
+        rays.append([float(ray[0]), float(ray[1]), float(ray[2]), float(ray[3])])
+
+    return rays
+
+
+def bilinear_depth_at(depth: np.ndarray, pixel_x: float, pixel_y: float) -> float:
+    x = float(np.clip(pixel_x, 0.0, WIDTH - 1.0))
+    y = float(np.clip(pixel_y, 0.0, HEIGHT - 1.0))
+    x0 = int(np.floor(x))
+    y0 = int(np.floor(y))
+    x1 = min(x0 + 1, WIDTH - 1)
+    y1 = min(y0 + 1, HEIGHT - 1)
+    wx = x - x0
+    wy = y - y0
+
+    d00 = float(depth[y0, x0])
+    d10 = float(depth[y0, x1])
+    d01 = float(depth[y1, x0])
+    d11 = float(depth[y1, x1])
+    return (
+        d00 * (1.0 - wx) * (1.0 - wy)
+        + d10 * wx * (1.0 - wy)
+        + d01 * (1.0 - wx) * wy
+        + d11 * wx * wy
+    )
+
+
+def marker_camera_ray_to_world(
+    depth: np.ndarray,
+    depth_to_world_matrix: np.ndarray,
+    marker_camera_ray: list[float],
+) -> list[float] | None:
+    pixel_x, pixel_y, unit_plane_x, unit_plane_y = marker_camera_ray
+    depth_value = bilinear_depth_at(depth, pixel_x, pixel_y)
+    if depth_value <= 0.0 or depth_value > DEPTH_MAX_MM:
+        return None
+
+    point_in_depth = np.array([unit_plane_x, unit_plane_y, 1.0], dtype=np.float64)
+    ray_norm = float(np.linalg.norm(point_in_depth))
+    if ray_norm <= 0.0:
+        return None
+
+    point_in_depth = (point_in_depth / ray_norm) * (depth_value / 1000.0)
+    point_in_world = depth_to_world_matrix @ np.array(
+        [point_in_depth[0], point_in_depth[1], point_in_depth[2], 1.0], dtype=np.float64
+    )
+    outward_direction = point_in_world[:3] - depth_to_world_matrix[:3, 3]
+    outward_norm = float(np.linalg.norm(outward_direction))
+    if outward_norm <= 0.0:
+        marker_center_world = point_in_world[:3]
+    else:
+        marker_center_world = point_in_world[:3] + (
+            outward_direction / outward_norm
+        ) * MARKER_SPHERE_RADIUS_METRES
+
+    return [float(marker_center_world[0]), float(marker_center_world[1]), float(marker_center_world[2])]
+
+
+def resolve_marker_camera_rays(message: bytes, state: SharedState) -> bytes:
+    marker_camera_rays = parse_marker_camera_rays(message)
+    with state.lock:
+        frame = state.latest_marker_query_frame or state.latest_frame
+
+    if frame is None or frame.depth_to_world_matrix is None:
+        coordinates: list[list[float]] = []
+    else:
+        coordinates = [
+            coordinate
+            for coordinate in (
+                marker_camera_ray_to_world(frame.depth, frame.depth_to_world_matrix, marker_camera_ray)
+                for marker_camera_ray in marker_camera_rays
+            )
+            if coordinate is not None
+        ]
+
+    state.latest_hololens_marker_world_coordinates.set_coordinates(coordinates)
+    return json.dumps(coordinates, separators=(",", ":")).encode("utf-8")
 
 
 def parse_real_3d_coordinates(message: bytes) -> list[list[float]]:
@@ -349,6 +503,7 @@ def publish_sensor_frame(
     infrared: np.ndarray,
     sequence: int,
     client_timestamp: float,
+    depth_to_world_matrix: np.ndarray | None,
     state: SharedState,
     fps_counter: FpsCounter,
     image_writer: AsyncRawImagePickleWriter | None = None,
@@ -363,6 +518,7 @@ def publish_sensor_frame(
         sequence,
         client_timestamp,
         received_timestamp,
+        depth_to_world_matrix=depth_to_world_matrix,
         marker_detections=marker_detections or [],
     )
 
@@ -392,17 +548,21 @@ def process_message(
     if message.startswith(IR_MARKERS_PREFIX):
         return serialize_latest_marker_centers(state)
 
+    if message.startswith(IR_MARKER_RAYS_PREFIX):
+        return resolve_marker_camera_rays(message, state)
+
     if message.startswith(REAL_3D_COORD_PREFIX):
         return store_real_3d_coordinates(message, state)
 
     raw_stream_message = unwrap_raw_stream_request(message)
-    depth, infrared, sequence, client_timestamp = parse_sensor_images(raw_stream_message)
+    depth, infrared, sequence, client_timestamp, depth_to_world_matrix = parse_sensor_images(raw_stream_message)
     marker_detections = detect_infrared_markers(infrared, marker_tracker)
     frame, receive_fps = publish_sensor_frame(
         depth,
         infrared,
         sequence,
         client_timestamp,
+        depth_to_world_matrix,
         state,
         fps_counter,
         image_writer=image_writer,
@@ -552,6 +712,9 @@ class RawSensorImageReceiver:
             if message.startswith(IR_MARKERS_PREFIX):
                 return serialize_latest_marker_centers(self.state)
 
+            if message.startswith(IR_MARKER_RAYS_PREFIX):
+                return resolve_marker_camera_rays(message, self.state)
+
             if message.startswith(REAL_3D_COORD_PREFIX):
                 return store_real_3d_coordinates(message, self.state)
 
@@ -565,13 +728,14 @@ class RawSensorImageReceiver:
                 )
 
             raw_stream_message = unwrap_raw_stream_request(message)
-            depth, infrared, sequence, client_timestamp = parse_sensor_images(raw_stream_message)
+            depth, infrared, sequence, client_timestamp, depth_to_world_matrix = parse_sensor_images(raw_stream_message)
             marker_detections = detect_infrared_markers(infrared, self.marker_tracker)
             publish_sensor_frame(
                 depth,
                 infrared,
                 sequence,
                 client_timestamp,
+                depth_to_world_matrix,
                 self.state,
                 self.fps_counter,
                 image_writer=self.image_writer,
