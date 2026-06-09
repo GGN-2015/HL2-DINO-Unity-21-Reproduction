@@ -9,8 +9,35 @@ public class SimpleTcpClient : IDisposable
 {
     private readonly Socket socket;
     private readonly byte[] lengthPrefixBuffer;
+    private readonly object closeLock = new object();
+    private bool isConnected = false;
+    private bool isClosed = false;
 
-    public bool IsConnected { get; private set; }
+    public bool IsConnected
+    {
+        get
+        {
+            if (!isConnected || isClosed) return false;
+
+            if (!IsSocketStillConnected())
+            {
+                if (string.IsNullOrEmpty(LastError))
+                {
+                    LastError = "Remote endpoint closed the connection.";
+                }
+
+                Close();
+                return false;
+            }
+
+            return true;
+        }
+        private set
+        {
+            isConnected = value;
+        }
+    }
+
     public string LastError { get; private set; } = string.Empty;
 
     public SimpleTcpClient(string host, int port)
@@ -28,6 +55,7 @@ public class SimpleTcpClient : IDisposable
             socket.Connect(host, port);
             SendAll(new[] { SimpleTcpProtocolUtils.FramingStrategyL }, 1);
             IsConnected = true;
+            isClosed = false;
             LastError = string.Empty;
         }
         catch (Exception ex)
@@ -90,13 +118,24 @@ public class SimpleTcpClient : IDisposable
 
     public void Close()
     {
-        IsConnected = false;
-        try
+        lock (closeLock)
         {
-            socket.Shutdown(SocketShutdown.Both);
-            socket.Close();
+            if (isClosed) return;
+
+            IsConnected = false;
+            isClosed = true;
+            try
+            {
+                socket.Shutdown(SocketShutdown.Both);
+            }
+            catch { }
+
+            try
+            {
+                socket.Close();
+            }
+            catch { }
         }
-        catch { }
     }
 
     public void Dispose()
@@ -137,5 +176,18 @@ public class SimpleTcpClient : IDisposable
         }
 
         return true;
+    }
+
+    private bool IsSocketStillConnected()
+    {
+        try
+        {
+            return !(socket.Poll(0, SelectMode.SelectRead) && socket.Available == 0);
+        }
+        catch (Exception ex)
+        {
+            LastError = ex.Message;
+            return false;
+        }
     }
 }

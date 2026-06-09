@@ -387,6 +387,10 @@ public class ResearchModeController : MonoBehaviour
             while (sensorTcpRunning && latestSensorTcpFrame == null)
             {
                 Monitor.Wait(sensorTcpFrameLock, 250);
+                if (sensorTcpClient != null && !sensorTcpClient.IsConnected)
+                {
+                    return null;
+                }
             }
 
             if (!sensorTcpRunning) return null;
@@ -414,25 +418,22 @@ public class ResearchModeController : MonoBehaviour
             if (response == null)
             {
                 string reason = GetSensorTcpErrorReason(sensorTcpClient);
-                sensorTcpClient.Dispose();
-                sensorTcpClient = null;
-                SetSensorTcpStatus($"TCP connection failed: {reason}. Reconnecting to {sensorTcpHost}:{sensorTcpPort}.");
-                SleepSensorTcpThread(250);
+                DisconnectSensorTcpClient();
+                SetSensorTcpStatus($"TCP connection failed: {reason}. Retrying {sensorTcpHost}:{sensorTcpPort} in {GetSensorTcpReconnectIntervalSeconds():0.0}s.");
+                SleepSensorTcpReconnectInterval();
                 continue;
             }
 
             if (!IsOkSensorTcpResponse(response))
             {
                 string responseText = Encoding.ASCII.GetString(response);
-                sensorTcpClient.Dispose();
-                sensorTcpClient = null;
-                SetSensorTcpStatus($"TCP connection failed: server returned unexpected response '{responseText}'. Reconnecting to {sensorTcpHost}:{sensorTcpPort}.");
-                SleepSensorTcpThread(250);
+                DisconnectSensorTcpClient();
+                SetSensorTcpStatus($"TCP connection failed: server returned unexpected response '{responseText}'. Retrying {sensorTcpHost}:{sensorTcpPort} in {GetSensorTcpReconnectIntervalSeconds():0.0}s.");
+                SleepSensorTcpReconnectInterval();
             }
         }
 
-        sensorTcpClient?.Dispose();
-        sensorTcpClient = null;
+        DisconnectSensorTcpClient();
         sensorTcpPayloadBuffer = null;
     }
 
@@ -447,7 +448,14 @@ public class ResearchModeController : MonoBehaviour
 
             try
             {
-                UploadPendingMarkerCameraRays();
+                if (!UploadPendingMarkerCameraRays())
+                {
+                    string reason = GetSensorTcpErrorReason(markerTcpClient);
+                    DisconnectMarkerTcpClient();
+                    SetSensorTcpStatus($"IR marker TCP failed: {reason}. Retrying {sensorTcpHost}:{sensorTcpPort} in {GetSensorTcpReconnectIntervalSeconds():0.0}s.");
+                    SleepMarkerTcpReconnectInterval();
+                    continue;
+                }
             }
             catch (Exception ex)
             {
@@ -458,10 +466,9 @@ public class ResearchModeController : MonoBehaviour
             if (response == null)
             {
                 string reason = GetSensorTcpErrorReason(markerTcpClient);
-                markerTcpClient.Dispose();
-                markerTcpClient = null;
-                SetSensorTcpStatus($"IR marker TCP failed: {reason}. Reconnecting to {sensorTcpHost}:{sensorTcpPort}.");
-                SleepMarkerTcpThread(250);
+                DisconnectMarkerTcpClient();
+                SetSensorTcpStatus($"IR marker TCP failed: {reason}. Retrying {sensorTcpHost}:{sensorTcpPort} in {GetSensorTcpReconnectIntervalSeconds():0.0}s.");
+                SleepMarkerTcpReconnectInterval();
                 continue;
             }
 
@@ -482,20 +489,18 @@ public class ResearchModeController : MonoBehaviour
             SleepMarkerTcpThread((int)(MarkerPollingIntervalSeconds * 1000f));
         }
 
-        markerTcpClient?.Dispose();
-        markerTcpClient = null;
+        DisconnectMarkerTcpClient();
     }
 
     private bool EnsureSensorTcpConnected()
     {
         if (sensorTcpClient != null && sensorTcpClient.IsConnected) return true;
 
-        sensorTcpClient?.Dispose();
-        sensorTcpClient = null;
+        DisconnectSensorTcpClient();
 
         string host = sensorTcpHost;
         int port = sensorTcpPort;
-        float retrySeconds = Math.Max(0.1f, sensorTcpReconnectIntervalSeconds);
+        float retrySeconds = GetSensorTcpReconnectIntervalSeconds();
 
         SetSensorTcpStatus($"TCP connecting to {host}:{port}...");
 
@@ -505,7 +510,7 @@ public class ResearchModeController : MonoBehaviour
             string reason = GetSensorTcpErrorReason(client);
             client.Dispose();
             SetSensorTcpStatus($"TCP connection failed: {reason}. Retrying {host}:{port} in {retrySeconds:0.0}s.");
-            SleepSensorTcpThread((int)(retrySeconds * 1000f));
+            SleepSensorTcpReconnectInterval();
             return false;
         }
 
@@ -518,12 +523,11 @@ public class ResearchModeController : MonoBehaviour
     {
         if (markerTcpClient != null && markerTcpClient.IsConnected) return true;
 
-        markerTcpClient?.Dispose();
-        markerTcpClient = null;
+        DisconnectMarkerTcpClient();
 
         string host = sensorTcpHost;
         int port = sensorTcpPort;
-        float retrySeconds = Math.Max(0.1f, sensorTcpReconnectIntervalSeconds);
+        float retrySeconds = GetSensorTcpReconnectIntervalSeconds();
 
         SimpleTcpClient client = new SimpleTcpClient(host, port);
         if (!client.IsConnected)
@@ -531,12 +535,41 @@ public class ResearchModeController : MonoBehaviour
             string reason = GetSensorTcpErrorReason(client);
             client.Dispose();
             SetSensorTcpStatus($"IR marker TCP failed: {reason}. Retrying {host}:{port} in {retrySeconds:0.0}s.");
-            SleepMarkerTcpThread((int)(retrySeconds * 1000f));
+            SleepMarkerTcpReconnectInterval();
             return false;
         }
 
         markerTcpClient = client;
         return true;
+    }
+
+    private float GetSensorTcpReconnectIntervalSeconds()
+    {
+        return Math.Max(0.1f, sensorTcpReconnectIntervalSeconds);
+    }
+
+    private void SleepSensorTcpReconnectInterval()
+    {
+        SleepSensorTcpThread((int)(GetSensorTcpReconnectIntervalSeconds() * 1000f));
+    }
+
+    private void SleepMarkerTcpReconnectInterval()
+    {
+        SleepMarkerTcpThread((int)(GetSensorTcpReconnectIntervalSeconds() * 1000f));
+    }
+
+    private void DisconnectSensorTcpClient()
+    {
+        try { sensorTcpClient?.Dispose(); }
+        catch { }
+        sensorTcpClient = null;
+    }
+
+    private void DisconnectMarkerTcpClient()
+    {
+        try { markerTcpClient?.Dispose(); }
+        catch { }
+        markerTcpClient = null;
     }
 
     private static string GetSensorTcpErrorReason(SimpleTcpClient client)
@@ -599,12 +632,12 @@ public class ResearchModeController : MonoBehaviour
         }
     }
 
-    private void UploadPendingMarkerCameraRays()
+    private bool UploadPendingMarkerCameraRays()
     {
         List<MarkerCameraRay> markerCameraRays;
         lock (markerCameraRaysUploadLock)
         {
-            if (!markerCameraRaysUploadPending) return;
+            if (!markerCameraRaysUploadPending) return true;
 
             markerCameraRays = new List<MarkerCameraRay>(pendingMarkerCameraRaysUpload);
             markerCameraRaysUploadPending = false;
@@ -620,7 +653,7 @@ public class ResearchModeController : MonoBehaviour
                 markerCameraRaysUploadPending = true;
             }
 
-            throw new InvalidOperationException($"ir_marker_rays upload failed: {GetSensorTcpErrorReason(markerTcpClient)}");
+            return false;
         }
 
         List<Vector3> markerWorldPositions = ParseServerMarkerWorldResponse(response);
@@ -629,6 +662,8 @@ public class ResearchModeController : MonoBehaviour
             latestMarkerWorldPositions = markerWorldPositions;
             newMarkerWorldPositionsReceived = true;
         }
+
+        return true;
     }
 
     private static byte[] BuildMarkerCameraRaysPayload(List<MarkerCameraRay> markerCameraRays)

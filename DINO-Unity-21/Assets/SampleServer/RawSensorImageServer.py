@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+print("Server initializing ...", flush=True)
+
 import argparse
 import json
 import pickle
@@ -39,6 +41,7 @@ MARKER_SPHERE_RADIUS_METRES = 0.005
 WINDOW_NAME = "DINO Raw Sensor Stream"
 SHUTDOWN_MESSAGE = "Shutdown requested. Closing raw sensor server..."
 VISUALIZATION_INTERVAL_SECONDS = 1.0 / 30.0
+EXIT_HINT_TEXT = "press Q/Esc in the image window, to exit"
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 IR_DATA_DIR = PROJECT_ROOT / "IRData"
 SAVE_RAW_IMAGES_TO_PICKLE = False
@@ -77,6 +80,7 @@ class ThreadSafeCoordinateStore:
 @dataclass
 class SharedState:
     lock: threading.Condition = field(default_factory=threading.Condition)
+    active_tcp_connections: int = 0
     latest_frame: SensorFrame | None = None
     latest_marker_query_frame: SensorFrame | None = None
     latest_marker_centers: list[list[float]] = field(default_factory=list)
@@ -86,13 +90,24 @@ class SharedState:
 
 
 class RawSensorTcpServer(SimpleTcpServer):
+    def __init__(self, *args, state: SharedState | None = None, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.state = state
+
     def _handle(self, conn, addr) -> None:
         connected = datetime.now()
         print(f"[{connected:%Y-%m-%d %H:%M:%S.%f}] Client connected from {addr[0]}:{addr[1]}", flush=True)
+        if self.state is not None:
+            with self.state.lock:
+                self.state.active_tcp_connections += 1
+                self.state.last_error = ""
+                self.state.lock.notify_all()
         super()._handle(conn, addr)
 
     def _conn_close(self, addr) -> None:
         print(f"Client disconnected from {addr[0]}:{addr[1]}", flush=True)
+        if self.state is not None:
+            clear_connection_frame(self.state)
         super()._conn_close(addr)
 
 
@@ -215,6 +230,17 @@ def copy_sensor_frame(frame: SensorFrame) -> SensorFrame:
         depth_to_world_matrix=None if frame.depth_to_world_matrix is None else frame.depth_to_world_matrix.copy(),
         marker_detections=list(frame.marker_detections),
     )
+
+
+def clear_connection_frame(state: SharedState) -> None:
+    with state.lock:
+        state.active_tcp_connections = max(0, state.active_tcp_connections - 1)
+        state.latest_frame = None
+        state.latest_marker_query_frame = None
+        state.latest_marker_centers = []
+        state.receive_fps = 0.0
+        state.last_error = ""
+        state.lock.notify_all()
 
 
 def parse_sensor_images(message: bytes) -> tuple[np.ndarray, np.ndarray, int, float, np.ndarray | None]:
@@ -465,6 +491,12 @@ def draw_text(image: np.ndarray, lines: list[str]) -> None:
         y += 24
 
 
+def draw_exit_hint(image: np.ndarray) -> None:
+    position = (10, image.shape[0] - 14)
+    cv2.putText(image, EXIT_HINT_TEXT, position, cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(image, EXIT_HINT_TEXT, position, cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+
+
 def render_frame(frame: SensorFrame, receive_fps: float) -> np.ndarray:
     depth_display = cv2.cvtColor(normalize_depth_for_display(frame.depth), cv2.COLOR_GRAY2BGR)
     infrared_display = cv2.cvtColor(normalize_min_max_for_display(frame.infrared), cv2.COLOR_GRAY2BGR)
@@ -489,12 +521,15 @@ def render_frame(frame: SensorFrame, receive_fps: float) -> np.ndarray:
         ],
     )
 
-    return np.hstack((depth_display, infrared_display))
+    display = np.hstack((depth_display, infrared_display))
+    draw_exit_hint(display)
+    return display
 
 
-def render_waiting_frame(message: str) -> np.ndarray:
+def render_waiting_frame(title: str, message: str) -> np.ndarray:
     image = np.zeros((HEIGHT, WIDTH * 2, 3), dtype=np.uint8)
-    draw_text(image, ["Waiting for raw sensor frames", message])
+    draw_text(image, [title, message])
+    draw_exit_hint(image)
     return image
 
 
@@ -759,6 +794,7 @@ class RawSensorImageReceiver:
             self._raw_sensor_worker,
             quit_token=b"quit",
             client_timeout=self.client_timeout,
+            state=self.state,
         )
         self.server.set_debug_mode(False)
 
@@ -812,9 +848,19 @@ def visualization_loop(state: SharedState, stop_event: threading.Event) -> None:
             frame = state.latest_frame
             receive_fps = state.receive_fps
             last_error = state.last_error
+            active_tcp_connections = state.active_tcp_connections
 
         if frame is None:
-            display = render_waiting_frame(last_error or f"Listening on {HOST}:{PORT}")
+            if last_error:
+                waiting_title = "Waiting for raw sensor frames"
+                waiting_message = last_error
+            elif active_tcp_connections <= 0:
+                waiting_title = "Waiting for TCP connection"
+                waiting_message = f"Listening on {HOST}:{PORT}"
+            else:
+                waiting_title = "Waiting for raw sensor frames"
+                waiting_message = "TCP connected"
+            display = render_waiting_frame(waiting_title, waiting_message)
         else:
             display = render_frame(frame, receive_fps)
             if last_error:
