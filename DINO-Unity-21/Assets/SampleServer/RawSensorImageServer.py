@@ -15,17 +15,58 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+
+DEFAULT_HOST = "169.254.83.86"
+DEFAULT_PORT = 8888
+DEFAULT_WIDTH = 512
+DEFAULT_HEIGHT = 512
+SERVER_CONFIG_PATH = Path(__file__).with_name("RawSensorImageServerConfig.json")
+
+
+def load_server_config(config_path: Path = SERVER_CONFIG_PATH) -> dict[str, str | int]:
+    defaults = {
+        "host": DEFAULT_HOST,
+        "port": DEFAULT_PORT,
+        "width": DEFAULT_WIDTH,
+        "height": DEFAULT_HEIGHT,
+    }
+    if not config_path.exists():
+        return defaults
+
+    with config_path.open("r", encoding="utf-8") as file:
+        config = json.load(file)
+
+    if not isinstance(config, dict):
+        raise ValueError(f"Server config must be a JSON object: {config_path}")
+
+    loaded_config = {
+        "host": str(config.get("host", defaults["host"])),
+        "port": int(config.get("port", defaults["port"])),
+        "width": int(config.get("width", defaults["width"])),
+        "height": int(config.get("height", defaults["height"])),
+    }
+    if loaded_config["port"] <= 0:
+        raise ValueError(f"Server config port must be positive: {loaded_config['port']}")
+    if loaded_config["width"] <= 0 or loaded_config["height"] <= 0:
+        raise ValueError(
+            f"Server config image size must be positive: {loaded_config['width']}x{loaded_config['height']}"
+        )
+
+    return loaded_config
+
+
+SERVER_CONFIG = load_server_config()
+HOST = str(SERVER_CONFIG["host"])
+PORT = int(SERVER_CONFIG["port"])
+WIDTH = int(SERVER_CONFIG["width"])
+HEIGHT = int(SERVER_CONFIG["height"])
+PIXEL_COUNT = WIDTH * HEIGHT
+
 import cv2
 import numpy as np
 from ir_yolo_tracker import IRMarkerTracker, MarkerDetection, create_tracker, draw_detections
 from simple_tcp_server import SimpleTcpServer
 
-
-HOST = "169.254.83.86"
-PORT = 8888
-WIDTH = 512
-HEIGHT = 512
-PIXEL_COUNT = WIDTH * HEIGHT
 RAW_STREAM_PREFIX = b"raw_stream:"
 IR_MARKERS_PREFIX = b"ir_markers:"
 IR_MARKER_RAYS_PREFIX = b"ir_marker_rays:"
@@ -42,9 +83,11 @@ WINDOW_NAME = "DINO Raw Sensor Stream"
 SHUTDOWN_MESSAGE = "Shutdown requested. Closing raw sensor server..."
 VISUALIZATION_INTERVAL_SECONDS = 1.0 / 30.0
 EXIT_HINT_TEXT = "press Q/Esc in the image window, to exit"
+PROCESSING_AVERAGE_SAMPLE_COUNT = 120
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 IR_DATA_DIR = PROJECT_ROOT / "IRData"
 SAVE_RAW_IMAGES_TO_PICKLE = False
+PRINT_FRAME_LOG = False
 DEPTH_SAVE_DIR_NAME = "depth"
 INFRARED_SAVE_DIR_NAME = "infrared"
 
@@ -86,13 +129,22 @@ class SharedState:
     latest_marker_centers: list[list[float]] = field(default_factory=list)
     latest_hololens_marker_world_coordinates: ThreadSafeCoordinateStore = field(default_factory=ThreadSafeCoordinateStore)
     receive_fps: float = 0.0
+    average_yolo_marker_ms: float = 0.0
+    average_coordinate_ms: float = 0.0
     last_error: str = ""
 
 
 class RawSensorTcpServer(SimpleTcpServer):
-    def __init__(self, *args, state: SharedState | None = None, **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        state: SharedState | None = None,
+        on_disconnect=None,
+        **kwargs,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self.state = state
+        self.on_disconnect = on_disconnect
 
     def _handle(self, conn, addr) -> None:
         connected = datetime.now()
@@ -108,6 +160,8 @@ class RawSensorTcpServer(SimpleTcpServer):
         print(f"Client disconnected from {addr[0]}:{addr[1]}", flush=True)
         if self.state is not None:
             clear_connection_frame(self.state)
+        if self.on_disconnect is not None:
+            self.on_disconnect()
         super()._conn_close(addr)
 
 
@@ -130,6 +184,22 @@ class FpsCounter:
             return 0.0
 
         return (len(self.samples) - 1) / elapsed
+
+
+class RollingAverage:
+    def __init__(self, max_samples: int = PROCESSING_AVERAGE_SAMPLE_COUNT) -> None:
+        self.max_samples = max_samples
+        self.samples: deque[float] = deque(maxlen=max_samples)
+        self.lock = threading.Lock()
+
+    def add(self, value: float) -> float:
+        with self.lock:
+            self.samples.append(value)
+            return sum(self.samples) / len(self.samples)
+
+    def reset(self) -> None:
+        with self.lock:
+            self.samples.clear()
 
 
 @dataclass(frozen=True)
@@ -239,6 +309,8 @@ def clear_connection_frame(state: SharedState) -> None:
         state.latest_marker_query_frame = None
         state.latest_marker_centers = []
         state.receive_fps = 0.0
+        state.average_yolo_marker_ms = 0.0
+        state.average_coordinate_ms = 0.0
         state.last_error = ""
         state.lock.notify_all()
 
@@ -325,8 +397,14 @@ def unwrap_raw_stream_request(message: bytes) -> bytes:
     return message[len(RAW_STREAM_PREFIX):]
 
 
-def detect_infrared_markers(infrared: np.ndarray, marker_tracker: IRMarkerTracker) -> list[MarkerDetection]:
-    return marker_tracker.detect(infrared)
+def detect_infrared_markers(
+    infrared: np.ndarray,
+    marker_tracker: IRMarkerTracker,
+) -> tuple[list[MarkerDetection], float]:
+    start_time = time.perf_counter()
+    detections = marker_tracker.detect(infrared)
+    elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+    return detections, elapsed_ms
 
 
 def marker_detection_centers(detections: list[MarkerDetection]) -> list[list[float]]:
@@ -416,11 +494,16 @@ def marker_camera_ray_to_world(
     return [float(marker_center_world[0]), float(marker_center_world[1]), float(marker_center_world[2])]
 
 
-def resolve_marker_camera_rays(message: bytes, state: SharedState) -> bytes:
+def resolve_marker_camera_rays(
+    message: bytes,
+    state: SharedState,
+    coordinate_average: RollingAverage | None = None,
+) -> bytes:
     marker_camera_rays = parse_marker_camera_rays(message)
     with state.lock:
         frame = state.latest_marker_query_frame or state.latest_frame
 
+    start_time = time.perf_counter()
     if frame is None or frame.depth_to_world_matrix is None:
         coordinates: list[list[float]] = []
     else:
@@ -432,8 +515,14 @@ def resolve_marker_camera_rays(message: bytes, state: SharedState) -> bytes:
             )
             if coordinate is not None
         ]
+    elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+    average_coordinate_ms = coordinate_average.add(elapsed_ms) if coordinate_average is not None else elapsed_ms
 
     state.latest_hololens_marker_world_coordinates.set_coordinates(coordinates)
+    with state.lock:
+        state.average_coordinate_ms = average_coordinate_ms
+        state.lock.notify_all()
+
     return json.dumps(coordinates, separators=(",", ":")).encode("utf-8")
 
 
@@ -497,7 +586,12 @@ def draw_exit_hint(image: np.ndarray) -> None:
     cv2.putText(image, EXIT_HINT_TEXT, position, cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
 
 
-def render_frame(frame: SensorFrame, receive_fps: float) -> np.ndarray:
+def render_frame(
+    frame: SensorFrame,
+    receive_fps: float,
+    average_yolo_marker_ms: float,
+    average_coordinate_ms: float,
+) -> np.ndarray:
     depth_display = cv2.cvtColor(normalize_depth_for_display(frame.depth), cv2.COLOR_GRAY2BGR)
     infrared_display = cv2.cvtColor(normalize_min_max_for_display(frame.infrared), cv2.COLOR_GRAY2BGR)
     infrared_display = draw_detections(infrared_display, frame.marker_detections)
@@ -509,6 +603,7 @@ def render_frame(frame: SensorFrame, receive_fps: float) -> np.ndarray:
             "Depth 16-bit",
             f"Frame {frame.sequence}",
             f"RX FPS {receive_fps:.1f}",
+            f"YOLO+Coord {average_yolo_marker_ms + average_coordinate_ms:.1f} ms",
         ],
     )
     draw_text(
@@ -516,6 +611,8 @@ def render_frame(frame: SensorFrame, receive_fps: float) -> np.ndarray:
         [
             "Infrared 16-bit",
             f"Markers {len(frame.marker_detections)}",
+            f"YOLO {average_yolo_marker_ms:.1f} ms",
+            f"Coord {average_coordinate_ms:.1f} ms",
             f"Received {received_text}",
             f"Client TS {frame.client_timestamp:.3f}",
         ],
@@ -543,6 +640,7 @@ def publish_sensor_frame(
     fps_counter: FpsCounter,
     image_writer: AsyncRawImagePickleWriter | None = None,
     marker_detections: list[MarkerDetection] | None = None,
+    average_yolo_marker_ms: float | None = None,
 ) -> tuple[SensorFrame, float]:
     received_timestamp = time.time()
     receive_fps = fps_counter.tick(time.perf_counter())
@@ -561,6 +659,8 @@ def publish_sensor_frame(
         state.latest_frame = frame
         state.latest_marker_centers = marker_centers
         state.receive_fps = receive_fps
+        if average_yolo_marker_ms is not None:
+            state.average_yolo_marker_ms = average_yolo_marker_ms
         state.last_error = ""
         state.lock.notify_all()
 
@@ -575,6 +675,8 @@ def process_message(
     state: SharedState,
     fps_counter: FpsCounter,
     marker_tracker: IRMarkerTracker,
+    yolo_average: RollingAverage,
+    coordinate_average: RollingAverage,
     image_writer: AsyncRawImagePickleWriter | None = None,
 ) -> bytes:
     if message == b"quit":
@@ -584,14 +686,15 @@ def process_message(
         return serialize_latest_marker_centers(state)
 
     if message.startswith(IR_MARKER_RAYS_PREFIX):
-        return resolve_marker_camera_rays(message, state)
+        return resolve_marker_camera_rays(message, state, coordinate_average)
 
     if message.startswith(REAL_3D_COORD_PREFIX):
         return store_real_3d_coordinates(message, state)
 
     raw_stream_message = unwrap_raw_stream_request(message)
     depth, infrared, sequence, client_timestamp, depth_to_world_matrix = parse_sensor_images(raw_stream_message)
-    marker_detections = detect_infrared_markers(infrared, marker_tracker)
+    marker_detections, yolo_marker_ms = detect_infrared_markers(infrared, marker_tracker)
+    average_yolo_marker_ms = yolo_average.add(yolo_marker_ms)
     frame, receive_fps = publish_sensor_frame(
         depth,
         infrared,
@@ -602,12 +705,18 @@ def process_message(
         fps_counter,
         image_writer=image_writer,
         marker_detections=marker_detections,
+        average_yolo_marker_ms=average_yolo_marker_ms,
     )
     received = datetime.fromtimestamp(frame.received_timestamp)
+    with state.lock:
+        average_coordinate_ms = state.average_coordinate_ms
+    average_total_processing_ms = average_yolo_marker_ms + average_coordinate_ms
     print(
         f"[{received:%Y-%m-%d %H:%M:%S.%f}] "
         f"frame={frame.sequence} client_ts={frame.client_timestamp:.6f} "
         f"rx_fps={receive_fps:.2f} markers={len(frame.marker_detections)} "
+        f"avg_yolo_coord_ms={average_total_processing_ms:.2f} "
+        f"avg_yolo_ms={average_yolo_marker_ms:.2f} avg_coord_ms={average_coordinate_ms:.2f} "
         f"depth_shape={frame.depth.shape} infrared_shape={frame.infrared.shape}",
         flush=True,
     )
@@ -621,7 +730,7 @@ class RawSensorImageReceiver:
         host: str = HOST,
         port: int = PORT,
         client_timeout: float = 3600.0,
-        print_frame_log: bool = True,
+        print_frame_log: bool = PRINT_FRAME_LOG,
         save_raw_images: bool = SAVE_RAW_IMAGES_TO_PICKLE,
         image_output_dir: Path | str = IR_DATA_DIR,
     ) -> None:
@@ -636,6 +745,8 @@ class RawSensorImageReceiver:
         self.server_thread: threading.Thread | None = None
         self.server: RawSensorTcpServer | None = None
         self.fps_counter = FpsCounter()
+        self.yolo_average = RollingAverage()
+        self.coordinate_average = RollingAverage()
         self.image_writer = AsyncRawImagePickleWriter(self.image_output_dir) if save_raw_images else None
         self.marker_tracker = create_tracker()
 
@@ -738,6 +849,10 @@ class RawSensorImageReceiver:
     def get_latest_hololens_marker_world_coordinates(self) -> list[list[float]]:
         return self.state.latest_hololens_marker_world_coordinates.get_coordinates()
 
+    def _reset_processing_averages(self) -> None:
+        self.yolo_average.reset()
+        self.coordinate_average.reset()
+
     def _raw_sensor_worker(self, message: bytes) -> bytes:
         if message == b"quit":
             self.stop_event.set()
@@ -748,7 +863,7 @@ class RawSensorImageReceiver:
                 return serialize_latest_marker_centers(self.state)
 
             if message.startswith(IR_MARKER_RAYS_PREFIX):
-                return resolve_marker_camera_rays(message, self.state)
+                return resolve_marker_camera_rays(message, self.state, self.coordinate_average)
 
             if message.startswith(REAL_3D_COORD_PREFIX):
                 return store_real_3d_coordinates(message, self.state)
@@ -759,12 +874,15 @@ class RawSensorImageReceiver:
                     self.state,
                     self.fps_counter,
                     self.marker_tracker,
+                    self.yolo_average,
+                    self.coordinate_average,
                     image_writer=self.image_writer,
                 )
 
             raw_stream_message = unwrap_raw_stream_request(message)
             depth, infrared, sequence, client_timestamp, depth_to_world_matrix = parse_sensor_images(raw_stream_message)
-            marker_detections = detect_infrared_markers(infrared, self.marker_tracker)
+            marker_detections, yolo_marker_ms = detect_infrared_markers(infrared, self.marker_tracker)
+            average_yolo_marker_ms = self.yolo_average.add(yolo_marker_ms)
             publish_sensor_frame(
                 depth,
                 infrared,
@@ -775,6 +893,7 @@ class RawSensorImageReceiver:
                 self.fps_counter,
                 image_writer=self.image_writer,
                 marker_detections=marker_detections,
+                average_yolo_marker_ms=average_yolo_marker_ms,
             )
 
             return b"ok"
@@ -795,6 +914,7 @@ class RawSensorImageReceiver:
             quit_token=b"quit",
             client_timeout=self.client_timeout,
             state=self.state,
+            on_disconnect=self._reset_processing_averages,
         )
         self.server.set_debug_mode(False)
 
@@ -847,6 +967,8 @@ def visualization_loop(state: SharedState, stop_event: threading.Event) -> None:
         with state.lock:
             frame = state.latest_frame
             receive_fps = state.receive_fps
+            average_yolo_marker_ms = state.average_yolo_marker_ms
+            average_coordinate_ms = state.average_coordinate_ms
             last_error = state.last_error
             active_tcp_connections = state.active_tcp_connections
 
@@ -862,7 +984,7 @@ def visualization_loop(state: SharedState, stop_event: threading.Event) -> None:
                 waiting_message = "TCP connected"
             display = render_waiting_frame(waiting_title, waiting_message)
         else:
-            display = render_frame(frame, receive_fps)
+            display = render_frame(frame, receive_fps, average_yolo_marker_ms, average_coordinate_ms)
             if last_error:
                 draw_text(display, [last_error])
 
@@ -882,7 +1004,7 @@ def start_receiver(
     host: str = HOST,
     port: int = PORT,
     show_visualization: bool = False,
-    print_frame_log: bool = True,
+    print_frame_log: bool = PRINT_FRAME_LOG,
     save_raw_images: bool = SAVE_RAW_IMAGES_TO_PICKLE,
     image_output_dir: Path | str = IR_DATA_DIR,
 ) -> RawSensorImageReceiver:
@@ -969,6 +1091,12 @@ def parse_args() -> argparse.Namespace:
         default=str(IR_DATA_DIR),
         help=f"Directory for saved pickle files. Default: {IR_DATA_DIR}",
     )
+    parser.add_argument(
+        "--print-frame-log",
+        action="store_true",
+        default=PRINT_FRAME_LOG,
+        help="Print one receive/debug log line for every raw sensor frame.",
+    )
     return parser.parse_args()
 
 
@@ -977,6 +1105,7 @@ def main() -> None:
     receiver = RawSensorImageReceiver(
         host=args.host,
         port=args.port,
+        print_frame_log=args.print_frame_log,
         save_raw_images=args.save_raw_images,
         image_output_dir=args.image_output_dir,
     )

@@ -43,6 +43,19 @@ The default server address is:
 169.254.83.86:8888
 ```
 
+The Python server reads its default bind address and image size from `DINO-Unity-21/Assets/SampleServer/RawSensorImageServerConfig.json`:
+
+```json
+{
+  "host": "169.254.83.86",
+  "port": 8888,
+  "width": 512,
+  "height": 512
+}
+```
+
+Use `host` and `port` for the PC network adapter address and TCP port. `width` and `height` must match the raw sensor frame size sent by the HoloLens app. Command-line `--host` and `--port` values still override the JSON defaults for one server run.
+
 In the `SampleSceneMRTK` scene, the TCP streaming script is bound to the `Managers -> RM_Manager (Research Mode Controller)` object. You can turn raw sensor streaming on or off in this script and configure the IP address and port.
 
 The provided scenes already enable this stream on `Managers/RM_Manager`, which contains the `ResearchModeController` component. The relevant Inspector fields are:
@@ -81,7 +94,7 @@ When the HoloLens client connects, it prints a line like:
 [2026-06-06 22:00:00.000000] Client connected from <client-ip>:<client-port>
 ```
 
-For every received frame, the server converts the depth and infrared payloads to NumPy arrays with shape `(512, 512)` and prints the receive timestamp, frame sequence number, client timestamp, FPS, and array shapes. It also opens an OpenCV visualization window. The left image is depth, where near pixels are bright and far pixels are dark. The right image is infrared, normalized per frame with min-max scaling. Press `Q`, `Esc`, or `Ctrl+C` in the terminal to stop the server.
+For every received frame, the server converts the depth and infrared payloads to NumPy arrays with shape `(512, 512)`. Per-frame terminal logging is disabled by default; pass `--print-frame-log` to print the receive timestamp, frame sequence number, client timestamp, FPS, processing time, and array shapes. The server also opens an OpenCV visualization window. The left image is depth, where near pixels are bright and far pixels are dark. The right image is infrared, normalized per frame with min-max scaling. Press `Q`, `Esc`, or `Ctrl+C` in the terminal to stop the server.
 
 When raw image saving is enabled, the server creates the `IRData` folder in the project root if it does not already exist. Saving runs on a background writer thread so disk I/O does not block the TCP server receive loop. Depth images are saved under `IRData/depth`, and infrared images are saved under `IRData/infrared`. Each file contains one NumPy `uint16` array with shape `(512, 512)`, serialized with Python `pickle`. File names use a 7-digit decimal counter with leading zeros, such as `0000001.pickle`, `0000002.pickle`, and so on. The depth and infrared files with the same number belong to the same received frame.
 
@@ -137,7 +150,7 @@ By default, the getter methods return copies so caller code cannot accidentally 
 
 If the server cannot bind to `169.254.83.86`, make sure that this IP exists on the PC network adapter connected to the HoloLens. If you use another server IP, update both places:
 
-1. `HOST` in `DINO-Unity-21/Assets/SampleServer/RawSensorImageServer.py`
+1. `host` in `DINO-Unity-21/Assets/SampleServer/RawSensorImageServerConfig.json`, or pass `--host <ip>` when starting the server.
 1. `Sensor Tcp Host` on `Managers/RM_Manager` in the Unity scene
 
 If no client connection appears in the server terminal:
