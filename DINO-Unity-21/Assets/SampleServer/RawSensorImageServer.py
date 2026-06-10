@@ -20,15 +20,27 @@ DEFAULT_HOST = "169.254.83.86"
 DEFAULT_PORT = 8888
 DEFAULT_WIDTH = 512
 DEFAULT_HEIGHT = 512
+DEFAULT_DETECTOR = "blob"
+DEFAULT_BLOB_THRESHOLD_PERCENTILE = 99.7
+DEFAULT_BLOB_MIN_THRESHOLD = 0
+DEFAULT_BLOB_MIN_AREA = 6
+DEFAULT_BLOB_MAX_AREA = 3000
+DEFAULT_BLOB_MAX_MARKERS = 16
 SERVER_CONFIG_PATH = Path(__file__).with_name("RawSensorImageServerConfig.json")
 
 
-def load_server_config(config_path: Path = SERVER_CONFIG_PATH) -> dict[str, str | int]:
+def load_server_config(config_path: Path = SERVER_CONFIG_PATH) -> dict[str, str | int | float]:
     defaults = {
         "host": DEFAULT_HOST,
         "port": DEFAULT_PORT,
         "width": DEFAULT_WIDTH,
         "height": DEFAULT_HEIGHT,
+        "detector": DEFAULT_DETECTOR,
+        "blob_threshold_percentile": DEFAULT_BLOB_THRESHOLD_PERCENTILE,
+        "blob_min_threshold": DEFAULT_BLOB_MIN_THRESHOLD,
+        "blob_min_area": DEFAULT_BLOB_MIN_AREA,
+        "blob_max_area": DEFAULT_BLOB_MAX_AREA,
+        "blob_max_markers": DEFAULT_BLOB_MAX_MARKERS,
     }
     if not config_path.exists():
         return defaults
@@ -44,12 +56,27 @@ def load_server_config(config_path: Path = SERVER_CONFIG_PATH) -> dict[str, str 
         "port": int(config.get("port", defaults["port"])),
         "width": int(config.get("width", defaults["width"])),
         "height": int(config.get("height", defaults["height"])),
+        "detector": str(config.get("detector", defaults["detector"])).lower(),
+        "blob_threshold_percentile": float(
+            config.get("blob_threshold_percentile", defaults["blob_threshold_percentile"])
+        ),
+        "blob_min_threshold": int(config.get("blob_min_threshold", defaults["blob_min_threshold"])),
+        "blob_min_area": int(config.get("blob_min_area", defaults["blob_min_area"])),
+        "blob_max_area": int(config.get("blob_max_area", defaults["blob_max_area"])),
+        "blob_max_markers": int(config.get("blob_max_markers", defaults["blob_max_markers"])),
     }
     if loaded_config["port"] <= 0:
         raise ValueError(f"Server config port must be positive: {loaded_config['port']}")
     if loaded_config["width"] <= 0 or loaded_config["height"] <= 0:
         raise ValueError(
             f"Server config image size must be positive: {loaded_config['width']}x{loaded_config['height']}"
+        )
+    if loaded_config["detector"] not in ("blob", "yolo"):
+        raise ValueError(f"Server config detector must be 'blob' or 'yolo': {loaded_config['detector']}")
+    if not 0.0 <= loaded_config["blob_threshold_percentile"] <= 100.0:
+        raise ValueError(
+            "Server config blob_threshold_percentile must be between 0 and 100: "
+            f"{loaded_config['blob_threshold_percentile']}"
         )
 
     return loaded_config
@@ -61,6 +88,12 @@ PORT = int(SERVER_CONFIG["port"])
 WIDTH = int(SERVER_CONFIG["width"])
 HEIGHT = int(SERVER_CONFIG["height"])
 PIXEL_COUNT = WIDTH * HEIGHT
+DETECTOR = str(SERVER_CONFIG["detector"])
+BLOB_THRESHOLD_PERCENTILE = float(SERVER_CONFIG["blob_threshold_percentile"])
+BLOB_MIN_THRESHOLD = int(SERVER_CONFIG["blob_min_threshold"])
+BLOB_MIN_AREA = int(SERVER_CONFIG["blob_min_area"])
+BLOB_MAX_AREA = int(SERVER_CONFIG["blob_max_area"])
+BLOB_MAX_MARKERS = int(SERVER_CONFIG["blob_max_markers"])
 
 import cv2
 import numpy as np
@@ -68,13 +101,17 @@ from ir_yolo_tracker import IRMarkerTracker, MarkerDetection, create_tracker, dr
 from simple_tcp_server import SimpleTcpServer
 
 RAW_STREAM_PREFIX = b"raw_stream:"
-IR_MARKERS_PREFIX = b"ir_markers:"
-IR_MARKER_RAYS_PREFIX = b"ir_marker_rays:"
-REAL_3D_COORD_PREFIX = b"real_3d_coord:"
 MAGIC_V1 = b"DINOIMG1"
 MAGIC_V2 = b"DINOIMG2"
+MAGIC_V3 = b"DINOIMG3"
+MAGIC_V4 = b"DINOIMG4"
 HEADER_V1_STRUCT = struct.Struct("<8siiQdii")
 HEADER_V2_STRUCT = struct.Struct("<8siiQdiii")
+HEADER_V3_STRUCT = struct.Struct("<8siiQdiiii")
+HEADER_V4_STRUCT = struct.Struct("<8siiQdiiii")
+COORD_RESPONSE_MAGIC = b"DINOXYZ1"
+COORD_RESPONSE_HEADER_STRUCT = struct.Struct("<8sI")
+COORD_RESPONSE_POINT_STRUCT = struct.Struct("<fff")
 DEPTH_TO_WORLD_MATRIX_VALUES = 16
 DEPTH_MIN_MM = 1
 DEPTH_MAX_MM = 4090
@@ -100,24 +137,8 @@ class SensorFrame:
     client_timestamp: float
     received_timestamp: float
     depth_to_world_matrix: np.ndarray | None = None
+    unit_plane_map: np.ndarray | None = None
     marker_detections: list[MarkerDetection] = field(default_factory=list)
-
-
-@dataclass
-class ThreadSafeCoordinateStore:
-    lock: threading.Lock = field(default_factory=threading.Lock)
-    coordinates: list[list[float]] = field(default_factory=list)
-    updated_timestamp: float | None = None
-
-    def set_coordinates(self, coordinates: list[list[float]]) -> None:
-        copied_coordinates = [coordinate[:] for coordinate in coordinates]
-        with self.lock:
-            self.coordinates = copied_coordinates
-            self.updated_timestamp = time.time()
-
-    def get_coordinates(self) -> list[list[float]]:
-        with self.lock:
-            return [coordinate[:] for coordinate in self.coordinates]
 
 
 @dataclass
@@ -125,9 +146,6 @@ class SharedState:
     lock: threading.Condition = field(default_factory=threading.Condition)
     active_tcp_connections: int = 0
     latest_frame: SensorFrame | None = None
-    latest_marker_query_frame: SensorFrame | None = None
-    latest_marker_centers: list[list[float]] = field(default_factory=list)
-    latest_hololens_marker_world_coordinates: ThreadSafeCoordinateStore = field(default_factory=ThreadSafeCoordinateStore)
     receive_fps: float = 0.0
     average_yolo_marker_ms: float = 0.0
     average_coordinate_ms: float = 0.0
@@ -200,6 +218,67 @@ class RollingAverage:
     def reset(self) -> None:
         with self.lock:
             self.samples.clear()
+
+
+class BlobMarkerTracker:
+    def __init__(
+        self,
+        *,
+        threshold_percentile: float = BLOB_THRESHOLD_PERCENTILE,
+        min_threshold: int = BLOB_MIN_THRESHOLD,
+        min_area: int = BLOB_MIN_AREA,
+        max_area: int = BLOB_MAX_AREA,
+        max_markers: int = BLOB_MAX_MARKERS,
+    ) -> None:
+        self.threshold_percentile = threshold_percentile
+        self.min_threshold = min_threshold
+        self.min_area = min_area
+        self.max_area = max_area
+        self.max_markers = max_markers
+
+    def detect(self, frame: np.ndarray) -> list[MarkerDetection]:
+        threshold_index = int((self.threshold_percentile / 100.0) * (frame.size - 1))
+        threshold = max(self.min_threshold, int(np.partition(frame.ravel(), threshold_index)[threshold_index]))
+        _, mask = cv2.threshold(frame, threshold, 255, cv2.THRESH_BINARY)
+        mask8 = mask.astype(np.uint8, copy=False)
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask8, connectivity=8)
+
+        detections: list[MarkerDetection] = []
+        for label_index in range(1, num_labels):
+            area = int(stats[label_index, cv2.CC_STAT_AREA])
+            if area < self.min_area or area > self.max_area:
+                continue
+
+            x = int(stats[label_index, cv2.CC_STAT_LEFT])
+            y = int(stats[label_index, cv2.CC_STAT_TOP])
+            width = int(stats[label_index, cv2.CC_STAT_WIDTH])
+            height = int(stats[label_index, cv2.CC_STAT_HEIGHT])
+            if width <= 0 or height <= 0:
+                continue
+
+            fill_ratio = area / float(width * height)
+            if fill_ratio < 0.35:
+                continue
+
+            detections.append(
+                MarkerDetection(
+                    bbox_xyxy=(float(x), float(y), float(x + width - 1), float(y + height - 1)),
+                    confidence=min(1.0, area / max(1.0, float(self.max_area))),
+                )
+            )
+
+        detections.sort(key=lambda detection: detection.confidence, reverse=True)
+        if self.max_markers > 0:
+            detections = detections[: self.max_markers]
+        return detections
+
+
+def create_marker_tracker(detector: str):
+    if detector == "yolo":
+        return create_tracker()
+    if detector == "blob":
+        return BlobMarkerTracker()
+    raise ValueError(f"Unsupported detector: {detector}")
 
 
 @dataclass(frozen=True)
@@ -298,6 +377,7 @@ def copy_sensor_frame(frame: SensorFrame) -> SensorFrame:
         client_timestamp=frame.client_timestamp,
         received_timestamp=frame.received_timestamp,
         depth_to_world_matrix=None if frame.depth_to_world_matrix is None else frame.depth_to_world_matrix.copy(),
+        unit_plane_map=None if frame.unit_plane_map is None else frame.unit_plane_map.copy(),
         marker_detections=list(frame.marker_detections),
     )
 
@@ -306,8 +386,6 @@ def clear_connection_frame(state: SharedState) -> None:
     with state.lock:
         state.active_tcp_connections = max(0, state.active_tcp_connections - 1)
         state.latest_frame = None
-        state.latest_marker_query_frame = None
-        state.latest_marker_centers = []
         state.receive_fps = 0.0
         state.average_yolo_marker_ms = 0.0
         state.average_coordinate_ms = 0.0
@@ -315,20 +393,29 @@ def clear_connection_frame(state: SharedState) -> None:
         state.lock.notify_all()
 
 
-def parse_sensor_images(message: bytes) -> tuple[np.ndarray, np.ndarray, int, float, np.ndarray | None]:
+def parse_sensor_images(
+    message: bytes | memoryview,
+    cached_unit_plane_map: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, int, float, np.ndarray | None, np.ndarray | None]:
     if len(message) < HEADER_V1_STRUCT.size:
         raise ValueError(f"Message is too short: {len(message)} bytes")
 
-    magic = message[:8]
+    magic = bytes(message[:8])
     if magic == MAGIC_V1:
         return parse_sensor_images_v1(message)
     if magic == MAGIC_V2:
         return parse_sensor_images_v2(message)
+    if magic == MAGIC_V3:
+        return parse_sensor_images_v3(message)
+    if magic == MAGIC_V4:
+        return parse_sensor_images_v4(message, cached_unit_plane_map)
 
     raise ValueError(f"Bad packet magic: {magic!r}")
 
 
-def parse_sensor_images_v1(message: bytes) -> tuple[np.ndarray, np.ndarray, int, float, np.ndarray | None]:
+def parse_sensor_images_v1(
+    message: bytes | memoryview,
+) -> tuple[np.ndarray, np.ndarray, int, float, np.ndarray | None, np.ndarray | None]:
     magic, width, height, sequence, client_timestamp, depth_count, infrared_count = HEADER_V1_STRUCT.unpack_from(message, 0)
     if magic != MAGIC_V1:
         raise ValueError(f"Bad packet magic: {magic!r}")
@@ -348,10 +435,10 @@ def parse_sensor_images_v1(message: bytes) -> tuple[np.ndarray, np.ndarray, int,
     offset += depth_bytes
     infrared = np.frombuffer(message, dtype="<u2", count=infrared_count, offset=offset).reshape((height, width))
 
-    return depth, infrared, sequence, client_timestamp, None
+    return depth, infrared, sequence, client_timestamp, None, None
 
 
-def parse_sensor_images_v2(message: bytes) -> tuple[np.ndarray, np.ndarray, int, float, np.ndarray]:
+def parse_sensor_images_v2(message: bytes | memoryview) -> tuple[np.ndarray, np.ndarray, int, float, np.ndarray, np.ndarray | None]:
     (
         magic,
         width,
@@ -387,58 +474,140 @@ def parse_sensor_images_v2(message: bytes) -> tuple[np.ndarray, np.ndarray, int,
     offset += depth_bytes
     infrared = np.frombuffer(message, dtype="<u2", count=infrared_count, offset=offset).reshape((height, width))
 
-    return depth, infrared, sequence, client_timestamp, depth_to_world_matrix
+    return depth, infrared, sequence, client_timestamp, depth_to_world_matrix, None
 
 
-def unwrap_raw_stream_request(message: bytes) -> bytes:
+def parse_sensor_images_v3(message: bytes | memoryview) -> tuple[np.ndarray, np.ndarray, int, float, np.ndarray, np.ndarray]:
+    (
+        magic,
+        width,
+        height,
+        sequence,
+        client_timestamp,
+        depth_count,
+        infrared_count,
+        matrix_count,
+        unit_plane_count,
+    ) = HEADER_V3_STRUCT.unpack_from(message, 0)
+    if magic != MAGIC_V3:
+        raise ValueError(f"Bad packet magic: {magic!r}")
+    if width != WIDTH or height != HEIGHT:
+        raise ValueError(f"Unexpected image size: {width}x{height}")
+    if depth_count != PIXEL_COUNT or infrared_count != PIXEL_COUNT:
+        raise ValueError(f"Unexpected pixel counts: depth={depth_count}, infrared={infrared_count}")
+    if matrix_count != DEPTH_TO_WORLD_MATRIX_VALUES:
+        raise ValueError(f"Unexpected depth-to-world matrix value count: {matrix_count}")
+    if unit_plane_count != PIXEL_COUNT:
+        raise ValueError(f"Unexpected unit-plane pixel count: {unit_plane_count}")
+
+    matrix_bytes = matrix_count * np.dtype(np.float64).itemsize
+    unit_plane_bytes = unit_plane_count * 2 * np.dtype(np.float32).itemsize
+    depth_bytes = depth_count * np.dtype(np.uint16).itemsize
+    infrared_bytes = infrared_count * np.dtype(np.uint16).itemsize
+    expected_size = HEADER_V3_STRUCT.size + matrix_bytes + unit_plane_bytes + depth_bytes + infrared_bytes
+    if len(message) != expected_size:
+        raise ValueError(f"Unexpected packet size: got {len(message)}, expected {expected_size}")
+
+    offset = HEADER_V3_STRUCT.size
+    depth_to_world_matrix = np.frombuffer(message, dtype="<f8", count=matrix_count, offset=offset).reshape(
+        (4, 4), order="F"
+    )
+    offset += matrix_bytes
+    unit_plane_map = np.frombuffer(message, dtype="<f4", count=unit_plane_count * 2, offset=offset).reshape(
+        (height, width, 2)
+    )
+    offset += unit_plane_bytes
+    depth = np.frombuffer(message, dtype="<u2", count=depth_count, offset=offset).reshape((height, width))
+    offset += depth_bytes
+    infrared = np.frombuffer(message, dtype="<u2", count=infrared_count, offset=offset).reshape((height, width))
+
+    return depth, infrared, sequence, client_timestamp, depth_to_world_matrix, unit_plane_map
+
+
+def parse_sensor_images_v4(
+    message: bytes | memoryview,
+    cached_unit_plane_map: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray, int, float, np.ndarray, np.ndarray]:
+    (
+        magic,
+        width,
+        height,
+        sequence,
+        client_timestamp,
+        depth_count,
+        infrared_count,
+        matrix_count,
+        unit_plane_count,
+    ) = HEADER_V4_STRUCT.unpack_from(message, 0)
+    if magic != MAGIC_V4:
+        raise ValueError(f"Bad packet magic: {magic!r}")
+    if width != WIDTH or height != HEIGHT:
+        raise ValueError(f"Unexpected image size: {width}x{height}")
+    if depth_count != PIXEL_COUNT or infrared_count != PIXEL_COUNT:
+        raise ValueError(f"Unexpected pixel counts: depth={depth_count}, infrared={infrared_count}")
+    if matrix_count != DEPTH_TO_WORLD_MATRIX_VALUES:
+        raise ValueError(f"Unexpected depth-to-world matrix value count: {matrix_count}")
+    if unit_plane_count not in (0, PIXEL_COUNT):
+        raise ValueError(f"Unexpected unit-plane pixel count: {unit_plane_count}")
+
+    matrix_bytes = matrix_count * np.dtype(np.float64).itemsize
+    unit_plane_bytes = unit_plane_count * 2 * np.dtype(np.float32).itemsize
+    depth_bytes = depth_count * np.dtype(np.uint16).itemsize
+    infrared_bytes = infrared_count * np.dtype(np.uint16).itemsize
+    expected_size = HEADER_V4_STRUCT.size + matrix_bytes + unit_plane_bytes + depth_bytes + infrared_bytes
+    if len(message) != expected_size:
+        raise ValueError(f"Unexpected packet size: got {len(message)}, expected {expected_size}")
+
+    offset = HEADER_V4_STRUCT.size
+    depth_to_world_matrix = np.frombuffer(message, dtype="<f8", count=matrix_count, offset=offset).reshape(
+        (4, 4), order="F"
+    )
+    offset += matrix_bytes
+    if unit_plane_count:
+        unit_plane_map = np.frombuffer(message, dtype="<f4", count=unit_plane_count * 2, offset=offset).reshape(
+            (height, width, 2)
+        )
+    else:
+        if cached_unit_plane_map is None:
+            raise ValueError("DINOIMG4 frame omitted unit-plane map before one was cached")
+        unit_plane_map = cached_unit_plane_map
+    offset += unit_plane_bytes
+    depth = np.frombuffer(message, dtype="<u2", count=depth_count, offset=offset).reshape((height, width))
+    offset += depth_bytes
+    infrared = np.frombuffer(message, dtype="<u2", count=infrared_count, offset=offset).reshape((height, width))
+
+    return depth, infrared, sequence, client_timestamp, depth_to_world_matrix, unit_plane_map
+
+
+def unwrap_raw_stream_request(message: bytes) -> memoryview:
     if not message.startswith(RAW_STREAM_PREFIX):
         raise ValueError("Unsupported request prefix")
 
-    return message[len(RAW_STREAM_PREFIX):]
+    return memoryview(message)[len(RAW_STREAM_PREFIX):]
+
+
+def packet_contains_unit_plane_map(message: bytes | memoryview) -> bool:
+    if len(message) < HEADER_V1_STRUCT.size:
+        return False
+
+    magic = bytes(message[:8])
+    if magic == MAGIC_V3:
+        return True
+    if magic != MAGIC_V4 or len(message) < HEADER_V4_STRUCT.size:
+        return False
+
+    unit_plane_count = HEADER_V4_STRUCT.unpack_from(message, 0)[8]
+    return unit_plane_count == PIXEL_COUNT
 
 
 def detect_infrared_markers(
     infrared: np.ndarray,
-    marker_tracker: IRMarkerTracker,
+    marker_tracker,
 ) -> tuple[list[MarkerDetection], float]:
     start_time = time.perf_counter()
     detections = marker_tracker.detect(infrared)
     elapsed_ms = (time.perf_counter() - start_time) * 1000.0
     return detections, elapsed_ms
-
-
-def marker_detection_centers(detections: list[MarkerDetection]) -> list[list[float]]:
-    return [[float(x), float(y)] for x, y in (detection.center_xy for detection in detections)]
-
-
-def serialize_latest_marker_centers(state: SharedState) -> bytes:
-    with state.lock:
-        marker_centers = [center[:] for center in state.latest_marker_centers]
-        state.latest_marker_query_frame = state.latest_frame
-
-    return json.dumps(marker_centers, separators=(",", ":")).encode("utf-8")
-
-
-def parse_marker_camera_rays(message: bytes) -> list[list[float]]:
-    if not message.startswith(IR_MARKER_RAYS_PREFIX):
-        raise ValueError("Unsupported request prefix")
-
-    payload = message[len(IR_MARKER_RAYS_PREFIX):]
-    if not payload:
-        return []
-
-    decoded_payload = json.loads(payload.decode("utf-8"))
-    if not isinstance(decoded_payload, list):
-        raise ValueError("ir_marker_rays payload must be a JSON list")
-
-    rays: list[list[float]] = []
-    for ray in decoded_payload:
-        if not isinstance(ray, list) or len(ray) < 4:
-            raise ValueError("Each ir_marker_rays entry must be [pixel_x, pixel_y, unit_plane_x, unit_plane_y]")
-
-        rays.append([float(ray[0]), float(ray[1]), float(ray[2]), float(ray[3])])
-
-    return rays
 
 
 def bilinear_depth_at(depth: np.ndarray, pixel_x: float, pixel_y: float) -> float:
@@ -463,95 +632,124 @@ def bilinear_depth_at(depth: np.ndarray, pixel_x: float, pixel_y: float) -> floa
     )
 
 
-def marker_camera_ray_to_world(
+def bilinear_unit_plane_at(unit_plane_map: np.ndarray, pixel_x: float, pixel_y: float) -> tuple[float, float]:
+    x = float(np.clip(pixel_x, 0.0, WIDTH - 1.0))
+    y = float(np.clip(pixel_y, 0.0, HEIGHT - 1.0))
+    x0 = int(np.floor(x))
+    y0 = int(np.floor(y))
+    x1 = min(x0 + 1, WIDTH - 1)
+    y1 = min(y0 + 1, HEIGHT - 1)
+    wx = x - x0
+    wy = y - y0
+
+    p00 = unit_plane_map[y0, x0]
+    p10 = unit_plane_map[y0, x1]
+    p01 = unit_plane_map[y1, x0]
+    p11 = unit_plane_map[y1, x1]
+    unit_plane = (
+        p00 * (1.0 - wx) * (1.0 - wy)
+        + p10 * wx * (1.0 - wy)
+        + p01 * (1.0 - wx) * wy
+        + p11 * wx * wy
+    )
+    return float(unit_plane[0]), float(unit_plane[1])
+
+
+def marker_pixel_to_world(
     depth: np.ndarray,
     depth_to_world_matrix: np.ndarray,
-    marker_camera_ray: list[float],
+    unit_plane_map: np.ndarray,
+    marker_detection: MarkerDetection,
 ) -> list[float] | None:
-    pixel_x, pixel_y, unit_plane_x, unit_plane_y = marker_camera_ray
+    pixel_x, pixel_y = marker_detection.center_xy
+    unit_plane_x, unit_plane_y = bilinear_unit_plane_at(unit_plane_map, pixel_x, pixel_y)
     depth_value = bilinear_depth_at(depth, pixel_x, pixel_y)
     if depth_value <= 0.0 or depth_value > DEPTH_MAX_MM:
         return None
 
-    point_in_depth = np.array([unit_plane_x, unit_plane_y, 1.0], dtype=np.float64)
-    ray_norm = float(np.linalg.norm(point_in_depth))
+    ray_norm = (unit_plane_x * unit_plane_x + unit_plane_y * unit_plane_y + 1.0) ** 0.5
     if ray_norm <= 0.0:
         return None
 
-    point_in_depth = (point_in_depth / ray_norm) * (depth_value / 1000.0)
-    point_in_world = depth_to_world_matrix @ np.array(
-        [point_in_depth[0], point_in_depth[1], point_in_depth[2], 1.0], dtype=np.float64
+    depth_metres = depth_value / 1000.0
+    point_x = unit_plane_x * depth_metres / ray_norm
+    point_y = unit_plane_y * depth_metres / ray_norm
+    point_z = depth_metres / ray_norm
+
+    world_x = (
+        float(depth_to_world_matrix[0, 0]) * point_x
+        + float(depth_to_world_matrix[0, 1]) * point_y
+        + float(depth_to_world_matrix[0, 2]) * point_z
+        + float(depth_to_world_matrix[0, 3])
     )
-    outward_direction = point_in_world[:3] - depth_to_world_matrix[:3, 3]
-    outward_norm = float(np.linalg.norm(outward_direction))
+    world_y = (
+        float(depth_to_world_matrix[1, 0]) * point_x
+        + float(depth_to_world_matrix[1, 1]) * point_y
+        + float(depth_to_world_matrix[1, 2]) * point_z
+        + float(depth_to_world_matrix[1, 3])
+    )
+    world_z = (
+        float(depth_to_world_matrix[2, 0]) * point_x
+        + float(depth_to_world_matrix[2, 1]) * point_y
+        + float(depth_to_world_matrix[2, 2]) * point_z
+        + float(depth_to_world_matrix[2, 3])
+    )
+
+    outward_x = world_x - float(depth_to_world_matrix[0, 3])
+    outward_y = world_y - float(depth_to_world_matrix[1, 3])
+    outward_z = world_z - float(depth_to_world_matrix[2, 3])
+    outward_norm = (outward_x * outward_x + outward_y * outward_y + outward_z * outward_z) ** 0.5
     if outward_norm <= 0.0:
-        marker_center_world = point_in_world[:3]
+        marker_center_world = [world_x, world_y, world_z]
     else:
-        marker_center_world = point_in_world[:3] + (
-            outward_direction / outward_norm
-        ) * MARKER_SPHERE_RADIUS_METRES
+        radius_scale = MARKER_SPHERE_RADIUS_METRES / outward_norm
+        marker_center_world = [
+            world_x + outward_x * radius_scale,
+            world_y + outward_y * radius_scale,
+            world_z + outward_z * radius_scale,
+        ]
 
     return [float(marker_center_world[0]), float(marker_center_world[1]), float(marker_center_world[2])]
 
 
-def resolve_marker_camera_rays(
-    message: bytes,
-    state: SharedState,
+def resolve_marker_world_coordinates(
+    depth: np.ndarray,
+    depth_to_world_matrix: np.ndarray | None,
+    unit_plane_map: np.ndarray | None,
+    marker_detections: list[MarkerDetection],
     coordinate_average: RollingAverage | None = None,
-) -> bytes:
-    marker_camera_rays = parse_marker_camera_rays(message)
-    with state.lock:
-        frame = state.latest_marker_query_frame or state.latest_frame
-
+) -> tuple[list[list[float]], float]:
     start_time = time.perf_counter()
-    if frame is None or frame.depth_to_world_matrix is None:
+    if depth_to_world_matrix is None or unit_plane_map is None:
         coordinates: list[list[float]] = []
     else:
         coordinates = [
             coordinate
             for coordinate in (
-                marker_camera_ray_to_world(frame.depth, frame.depth_to_world_matrix, marker_camera_ray)
-                for marker_camera_ray in marker_camera_rays
+                marker_pixel_to_world(depth, depth_to_world_matrix, unit_plane_map, marker_detection)
+                for marker_detection in marker_detections
             )
             if coordinate is not None
         ]
     elapsed_ms = (time.perf_counter() - start_time) * 1000.0
     average_coordinate_ms = coordinate_average.add(elapsed_ms) if coordinate_average is not None else elapsed_ms
-
-    state.latest_hololens_marker_world_coordinates.set_coordinates(coordinates)
-    with state.lock:
-        state.average_coordinate_ms = average_coordinate_ms
-        state.lock.notify_all()
-
-    return json.dumps(coordinates, separators=(",", ":")).encode("utf-8")
+    return coordinates, average_coordinate_ms
 
 
-def parse_real_3d_coordinates(message: bytes) -> list[list[float]]:
-    if not message.startswith(REAL_3D_COORD_PREFIX):
-        raise ValueError("Unsupported request prefix")
-
-    payload = message[len(REAL_3D_COORD_PREFIX):]
-    if not payload:
-        return []
-
-    decoded_payload = json.loads(payload.decode("utf-8"))
-    if not isinstance(decoded_payload, list):
-        raise ValueError("real_3d_coord payload must be a JSON list")
-
-    coordinates: list[list[float]] = []
-    for coordinate in decoded_payload:
-        if not isinstance(coordinate, list) or len(coordinate) < 3:
-            raise ValueError("Each real_3d_coord entry must be a list with at least 3 values")
-
-        coordinates.append([float(coordinate[0]), float(coordinate[1]), float(coordinate[2])])
-
-    return coordinates
-
-
-def store_real_3d_coordinates(message: bytes, state: SharedState) -> bytes:
-    coordinates = parse_real_3d_coordinates(message)
-    state.latest_hololens_marker_world_coordinates.set_coordinates(coordinates)
-    return b"ok"
+def serialize_marker_world_coordinates(coordinates: list[list[float]]) -> bytes:
+    response = bytearray(COORD_RESPONSE_HEADER_STRUCT.size + len(coordinates) * COORD_RESPONSE_POINT_STRUCT.size)
+    COORD_RESPONSE_HEADER_STRUCT.pack_into(response, 0, COORD_RESPONSE_MAGIC, len(coordinates))
+    offset = COORD_RESPONSE_HEADER_STRUCT.size
+    for coordinate in coordinates:
+        COORD_RESPONSE_POINT_STRUCT.pack_into(
+            response,
+            offset,
+            float(coordinate[0]),
+            float(coordinate[1]),
+            float(coordinate[2]),
+        )
+        offset += COORD_RESPONSE_POINT_STRUCT.size
+    return bytes(response)
 
 
 def normalize_depth_for_display(depth: np.ndarray) -> np.ndarray:
@@ -603,7 +801,7 @@ def render_frame(
             "Depth 16-bit",
             f"Frame {frame.sequence}",
             f"RX FPS {receive_fps:.1f}",
-            f"YOLO+Coord {average_yolo_marker_ms + average_coordinate_ms:.1f} ms",
+            f"Detect+Coord {average_yolo_marker_ms + average_coordinate_ms:.1f} ms",
         ],
     )
     draw_text(
@@ -611,7 +809,7 @@ def render_frame(
         [
             "Infrared 16-bit",
             f"Markers {len(frame.marker_detections)}",
-            f"YOLO {average_yolo_marker_ms:.1f} ms",
+            f"Detect {average_yolo_marker_ms:.1f} ms",
             f"Coord {average_coordinate_ms:.1f} ms",
             f"Received {received_text}",
             f"Client TS {frame.client_timestamp:.3f}",
@@ -636,15 +834,16 @@ def publish_sensor_frame(
     sequence: int,
     client_timestamp: float,
     depth_to_world_matrix: np.ndarray | None,
+    unit_plane_map: np.ndarray | None,
     state: SharedState,
     fps_counter: FpsCounter,
     image_writer: AsyncRawImagePickleWriter | None = None,
     marker_detections: list[MarkerDetection] | None = None,
     average_yolo_marker_ms: float | None = None,
+    average_coordinate_ms: float | None = None,
 ) -> tuple[SensorFrame, float]:
     received_timestamp = time.time()
     receive_fps = fps_counter.tick(time.perf_counter())
-    marker_centers = marker_detection_centers(marker_detections or [])
     frame = SensorFrame(
         depth,
         infrared,
@@ -652,15 +851,17 @@ def publish_sensor_frame(
         client_timestamp,
         received_timestamp,
         depth_to_world_matrix=depth_to_world_matrix,
+        unit_plane_map=unit_plane_map,
         marker_detections=marker_detections or [],
     )
 
     with state.lock:
         state.latest_frame = frame
-        state.latest_marker_centers = marker_centers
         state.receive_fps = receive_fps
         if average_yolo_marker_ms is not None:
             state.average_yolo_marker_ms = average_yolo_marker_ms
+        if average_coordinate_ms is not None:
+            state.average_coordinate_ms = average_coordinate_ms
         state.last_error = ""
         state.lock.notify_all()
 
@@ -678,50 +879,52 @@ def process_message(
     yolo_average: RollingAverage,
     coordinate_average: RollingAverage,
     image_writer: AsyncRawImagePickleWriter | None = None,
+    cached_unit_plane_map: np.ndarray | None = None,
 ) -> bytes:
     if message == b"quit":
         return b"quit"
 
-    if message.startswith(IR_MARKERS_PREFIX):
-        return serialize_latest_marker_centers(state)
-
-    if message.startswith(IR_MARKER_RAYS_PREFIX):
-        return resolve_marker_camera_rays(message, state, coordinate_average)
-
-    if message.startswith(REAL_3D_COORD_PREFIX):
-        return store_real_3d_coordinates(message, state)
-
     raw_stream_message = unwrap_raw_stream_request(message)
-    depth, infrared, sequence, client_timestamp, depth_to_world_matrix = parse_sensor_images(raw_stream_message)
+    depth, infrared, sequence, client_timestamp, depth_to_world_matrix, unit_plane_map = parse_sensor_images(
+        raw_stream_message,
+        cached_unit_plane_map=cached_unit_plane_map,
+    )
     marker_detections, yolo_marker_ms = detect_infrared_markers(infrared, marker_tracker)
     average_yolo_marker_ms = yolo_average.add(yolo_marker_ms)
+    marker_world_coordinates, average_coordinate_ms = resolve_marker_world_coordinates(
+        depth,
+        depth_to_world_matrix,
+        unit_plane_map,
+        marker_detections,
+        coordinate_average,
+    )
     frame, receive_fps = publish_sensor_frame(
         depth,
         infrared,
         sequence,
         client_timestamp,
         depth_to_world_matrix,
+        unit_plane_map,
         state,
         fps_counter,
         image_writer=image_writer,
         marker_detections=marker_detections,
         average_yolo_marker_ms=average_yolo_marker_ms,
+        average_coordinate_ms=average_coordinate_ms,
     )
     received = datetime.fromtimestamp(frame.received_timestamp)
-    with state.lock:
-        average_coordinate_ms = state.average_coordinate_ms
     average_total_processing_ms = average_yolo_marker_ms + average_coordinate_ms
     print(
         f"[{received:%Y-%m-%d %H:%M:%S.%f}] "
         f"frame={frame.sequence} client_ts={frame.client_timestamp:.6f} "
         f"rx_fps={receive_fps:.2f} markers={len(frame.marker_detections)} "
-        f"avg_yolo_coord_ms={average_total_processing_ms:.2f} "
-        f"avg_yolo_ms={average_yolo_marker_ms:.2f} avg_coord_ms={average_coordinate_ms:.2f} "
+        f"avg_detect_coord_ms={average_total_processing_ms:.2f} "
+        f"avg_detect_ms={average_yolo_marker_ms:.2f} avg_coord_ms={average_coordinate_ms:.2f} "
         f"depth_shape={frame.depth.shape} infrared_shape={frame.infrared.shape}",
         flush=True,
     )
 
-    return b"ok"
+    return serialize_marker_world_coordinates(marker_world_coordinates)
 
 
 class RawSensorImageReceiver:
@@ -733,6 +936,7 @@ class RawSensorImageReceiver:
         print_frame_log: bool = PRINT_FRAME_LOG,
         save_raw_images: bool = SAVE_RAW_IMAGES_TO_PICKLE,
         image_output_dir: Path | str = IR_DATA_DIR,
+        detector: str = DETECTOR,
     ) -> None:
         self.host = host
         self.port = port
@@ -740,6 +944,7 @@ class RawSensorImageReceiver:
         self.print_frame_log = print_frame_log
         self.save_raw_images = save_raw_images
         self.image_output_dir = Path(image_output_dir)
+        self.detector = detector
         self.state = SharedState()
         self.stop_event = threading.Event()
         self.server_thread: threading.Thread | None = None
@@ -747,8 +952,9 @@ class RawSensorImageReceiver:
         self.fps_counter = FpsCounter()
         self.yolo_average = RollingAverage()
         self.coordinate_average = RollingAverage()
+        self.cached_unit_plane_map: np.ndarray | None = None
         self.image_writer = AsyncRawImagePickleWriter(self.image_output_dir) if save_raw_images else None
-        self.marker_tracker = create_tracker()
+        self.marker_tracker = create_marker_tracker(detector)
 
     def start(self) -> None:
         if self.server_thread is not None and self.server_thread.is_alive():
@@ -846,12 +1052,10 @@ class RawSensorImageReceiver:
         with self.state.lock:
             return self.state.last_error
 
-    def get_latest_hololens_marker_world_coordinates(self) -> list[list[float]]:
-        return self.state.latest_hololens_marker_world_coordinates.get_coordinates()
-
     def _reset_processing_averages(self) -> None:
         self.yolo_average.reset()
         self.coordinate_average.reset()
+        self.cached_unit_plane_map = None
 
     def _raw_sensor_worker(self, message: bytes) -> bytes:
         if message == b"quit":
@@ -859,17 +1063,10 @@ class RawSensorImageReceiver:
             return b"ok"
 
         try:
-            if message.startswith(IR_MARKERS_PREFIX):
-                return serialize_latest_marker_centers(self.state)
-
-            if message.startswith(IR_MARKER_RAYS_PREFIX):
-                return resolve_marker_camera_rays(message, self.state, self.coordinate_average)
-
-            if message.startswith(REAL_3D_COORD_PREFIX):
-                return store_real_3d_coordinates(message, self.state)
-
             if self.print_frame_log:
-                return process_message(
+                raw_stream_message = unwrap_raw_stream_request(message)
+                has_unit_plane_map = packet_contains_unit_plane_map(raw_stream_message)
+                response = process_message(
                     message,
                     self.state,
                     self.fps_counter,
@@ -877,26 +1074,48 @@ class RawSensorImageReceiver:
                     self.yolo_average,
                     self.coordinate_average,
                     image_writer=self.image_writer,
+                    cached_unit_plane_map=self.cached_unit_plane_map,
                 )
+                if has_unit_plane_map:
+                    with self.state.lock:
+                        if self.state.latest_frame is not None:
+                            unit_plane_map = self.state.latest_frame.unit_plane_map
+                            self.cached_unit_plane_map = None if unit_plane_map is None else unit_plane_map.copy()
+                return response
 
             raw_stream_message = unwrap_raw_stream_request(message)
-            depth, infrared, sequence, client_timestamp, depth_to_world_matrix = parse_sensor_images(raw_stream_message)
+            has_unit_plane_map = packet_contains_unit_plane_map(raw_stream_message)
+            depth, infrared, sequence, client_timestamp, depth_to_world_matrix, unit_plane_map = parse_sensor_images(
+                raw_stream_message,
+                cached_unit_plane_map=self.cached_unit_plane_map,
+            )
+            if has_unit_plane_map:
+                self.cached_unit_plane_map = unit_plane_map.copy()
             marker_detections, yolo_marker_ms = detect_infrared_markers(infrared, self.marker_tracker)
             average_yolo_marker_ms = self.yolo_average.add(yolo_marker_ms)
+            marker_world_coordinates, average_coordinate_ms = resolve_marker_world_coordinates(
+                depth,
+                depth_to_world_matrix,
+                unit_plane_map,
+                marker_detections,
+                self.coordinate_average,
+            )
             publish_sensor_frame(
                 depth,
                 infrared,
                 sequence,
                 client_timestamp,
                 depth_to_world_matrix,
+                unit_plane_map,
                 self.state,
                 self.fps_counter,
                 image_writer=self.image_writer,
                 marker_detections=marker_detections,
                 average_yolo_marker_ms=average_yolo_marker_ms,
+                average_coordinate_ms=average_coordinate_ms,
             )
 
-            return b"ok"
+            return serialize_marker_world_coordinates(marker_world_coordinates)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             with self.state.lock:
@@ -906,7 +1125,6 @@ class RawSensorImageReceiver:
             return b"error"
 
     def _server_loop(self) -> None:
-        print(f"Raw sensor server listening on {self.host}:{self.port}", flush=True)
         self.server = RawSensorTcpServer(
             self.host,
             self.port,
@@ -917,6 +1135,7 @@ class RawSensorImageReceiver:
             on_disconnect=self._reset_processing_averages,
         )
         self.server.set_debug_mode(False)
+        print(f"Raw sensor server listening on {self.host}:{self.port}", flush=True)
 
         try:
             while not self.stop_event.is_set() and self.server.running:
@@ -934,7 +1153,7 @@ class RawSensorImageReceiver:
 
 
 def server_loop(state: SharedState, stop_event: threading.Event) -> None:
-    receiver = RawSensorImageReceiver()
+    receiver = RawSensorImageReceiver(detector=DETECTOR)
     receiver.state = state
     receiver.stop_event = stop_event
     if receiver.image_writer is not None:
@@ -1007,6 +1226,7 @@ def start_receiver(
     print_frame_log: bool = PRINT_FRAME_LOG,
     save_raw_images: bool = SAVE_RAW_IMAGES_TO_PICKLE,
     image_output_dir: Path | str = IR_DATA_DIR,
+    detector: str = DETECTOR,
 ) -> RawSensorImageReceiver:
     global _default_receiver
 
@@ -1016,6 +1236,7 @@ def start_receiver(
         print_frame_log=print_frame_log,
         save_raw_images=save_raw_images,
         image_output_dir=image_output_dir,
+        detector=detector,
     )
     receiver.start()
     _default_receiver = receiver
@@ -1055,13 +1276,6 @@ def get_current_images(copy: bool = True) -> tuple[np.ndarray, np.ndarray] | Non
     return _default_receiver.get_current_images(copy=copy)
 
 
-def get_latest_hololens_marker_world_coordinates() -> list[list[float]]:
-    if _default_receiver is None:
-        return []
-
-    return _default_receiver.get_latest_hololens_marker_world_coordinates()
-
-
 def wait_for_images(timeout: float | None = None, copy: bool = True) -> tuple[np.ndarray, np.ndarray] | None:
     if _default_receiver is None:
         return None
@@ -1097,6 +1311,12 @@ def parse_args() -> argparse.Namespace:
         default=PRINT_FRAME_LOG,
         help="Print one receive/debug log line for every raw sensor frame.",
     )
+    parser.add_argument(
+        "--detector",
+        choices=("blob", "yolo"),
+        default=DETECTOR,
+        help=f"Marker detector to use. Default: {DETECTOR}",
+    )
     return parser.parse_args()
 
 
@@ -1108,6 +1328,7 @@ def main() -> None:
         print_frame_log=args.print_frame_log,
         save_raw_images=args.save_raw_images,
         image_output_dir=args.image_output_dir,
+        detector=args.detector,
     )
 
     def request_shutdown(signum: int, frame: object) -> None:

@@ -35,7 +35,11 @@ Original projects:
 
 ### Raw Sensor TCP Streaming
 
-This project can stream the HoloLens 2 raw 16-bit depth image and raw 16-bit infrared image to a Python TCP server in real time. Each frame contains two `512 x 512` `uint16` images. The Unity client sends frames from a background thread so the main Unity update loop is not blocked by TCP transfer. The C# client uses the `simple_tcp_server` L framing mode: one `L` negotiation byte when the socket connects, then `4-byte big-endian payload length + raw payload` for each request and response.
+This project can stream the HoloLens 2 raw 16-bit depth image and raw 16-bit infrared image to a Python TCP server in real time. Each frame contains two `512 x 512` `uint16` images and the depth-to-world matrix. The per-pixel depth camera unit-plane lookup table is sent once after a TCP connection is established, then reused by the server for later frames to reduce per-frame latency. The Unity client sends frames from a background thread so the main Unity update loop is not blocked by TCP transfer. The C# client uses the `simple_tcp_server` L framing mode: one `L` negotiation byte when the socket connects, then `4-byte big-endian payload length + raw payload` for each request and response.
+
+The raw sensor request is the only TCP protocol used for marker coordinates. For each `raw_stream:` request, the server detects marker balls in the current infrared frame, converts those detections to HoloLens 3D coordinates using the depth frame data in the same request, and returns a compact binary `DINOXYZ1` response containing the current-frame marker count followed by float32 `x, y, z` coordinates.
+
+The Unity client parses that response immediately and updates the marker sphere positions from the current frame. There is no separate marker polling connection or server-side coordinate cache.
 
 The default server address is:
 
@@ -50,11 +54,19 @@ The Python server reads its default bind address and image size from `DINO-Unity
   "host": "169.254.83.86",
   "port": 8888,
   "width": 512,
-  "height": 512
+  "height": 512,
+  "detector": "blob",
+  "blob_threshold_percentile": 99.7,
+  "blob_min_threshold": 0,
+  "blob_min_area": 6,
+  "blob_max_area": 3000,
+  "blob_max_markers": 16
 }
 ```
 
 Use `host` and `port` for the PC network adapter address and TCP port. `width` and `height` must match the raw sensor frame size sent by the HoloLens app. Command-line `--host` and `--port` values still override the JSON defaults for one server run.
+
+For lowest latency, `detector` defaults to `blob`, which detects bright infrared marker blobs with thresholding and connected components. Use `--detector yolo` or set `"detector": "yolo"` to switch back to the YOLO detector. The `blob_*` values tune the fast detector's threshold, component area limits, and maximum marker count.
 
 In the `SampleSceneMRTK` scene, the TCP streaming script is bound to the `Managers -> RM_Manager (Research Mode Controller)` object. You can turn raw sensor streaming on or off in this script and configure the IP address and port.
 
@@ -94,7 +106,7 @@ When the HoloLens client connects, it prints a line like:
 [2026-06-06 22:00:00.000000] Client connected from <client-ip>:<client-port>
 ```
 
-For every received frame, the server converts the depth and infrared payloads to NumPy arrays with shape `(512, 512)`. Per-frame terminal logging is disabled by default; pass `--print-frame-log` to print the receive timestamp, frame sequence number, client timestamp, FPS, processing time, and array shapes. The server also opens an OpenCV visualization window. The left image is depth, where near pixels are bright and far pixels are dark. The right image is infrared, normalized per frame with min-max scaling. Press `Q`, `Esc`, or `Ctrl+C` in the terminal to stop the server.
+For every received frame, the server converts the depth and infrared payloads to NumPy arrays with shape `(512, 512)`, runs marker detection, computes the marker 3D coordinates for that same frame, and returns those coordinates in the TCP response. Per-frame terminal logging is disabled by default; pass `--print-frame-log` to print the receive timestamp, frame sequence number, client timestamp, FPS, processing time, and array shapes. The server also opens an OpenCV visualization window. The left image is depth, where near pixels are bright and far pixels are dark. The right image is infrared, normalized per frame with min-max scaling. Press `Q`, `Esc`, or `Ctrl+C` in the terminal to stop the server.
 
 When raw image saving is enabled, the server creates the `IRData` folder in the project root if it does not already exist. Saving runs on a background writer thread so disk I/O does not block the TCP server receive loop. Depth images are saved under `IRData/depth`, and infrared images are saved under `IRData/infrared`. Each file contains one NumPy `uint16` array with shape `(512, 512)`, serialized with Python `pickle`. File names use a 7-digit decimal counter with leading zeros, such as `0000001.pickle`, `0000002.pickle`, and so on. The depth and infrared files with the same number belong to the same received frame.
 

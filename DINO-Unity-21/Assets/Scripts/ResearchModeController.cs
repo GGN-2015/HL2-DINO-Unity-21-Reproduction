@@ -1,6 +1,5 @@
 ﻿using UnityEngine;
 using System;
-using System.Runtime.InteropServices;
 using System.IO;
 using System.Text;
 using System.Threading;
@@ -64,17 +63,16 @@ public class ResearchModeController : MonoBehaviour
     private const int SensorImageWidth = 512;
     private const int SensorImageHeight = 512;
     private const int SensorImagePixelCount = SensorImageWidth * SensorImageHeight;
-    private const int SensorTcpHeaderV2BaseBytes = 44;
+    private const int SensorTcpHeaderV4BaseBytes = 48;
     private const int SensorTcpDepthToWorldMatrixValues = 16;
+    private const int SensorTcpUnitPlaneValuesPerPixel = 2;
     private const float Raw16MaxValue = 65535f;
     private const float DepthDisplayBlackMm = 1f;
     private const float DepthDisplayWhiteMm = 4090f;
     private const float SensorImageUploadIntervalSeconds = 1f / 30f;
     private static readonly byte[] SensorTcpRawStreamPrefix = Encoding.ASCII.GetBytes("raw_stream:");
-    private static readonly byte[] SensorTcpIrMarkersRequest = Encoding.ASCII.GetBytes("ir_markers:");
-    private static readonly byte[] SensorTcpIrMarkerRaysPrefix = Encoding.ASCII.GetBytes("ir_marker_rays:");
-    private static readonly byte[] SensorTcpPayloadMagic = Encoding.ASCII.GetBytes("DINOIMG2");
-    private const float MarkerPollingIntervalSeconds = 1f / 15f;
+    private static readonly byte[] SensorTcpPayloadMagic = Encoding.ASCII.GetBytes("DINOIMG4");
+    private static readonly byte[] MarkerWorldResponseMagic = Encoding.ASCII.GetBytes("DINOXYZ1");
     private const float MarkerSphereDiameterMetres = 0.01f;
 
     private static readonly int SourceChannelId = Shader.PropertyToID("_SourceChannel");
@@ -93,20 +91,14 @@ public class ResearchModeController : MonoBehaviour
     private Thread sensorTcpThread = null;
     private SimpleTcpClient sensorTcpClient = null;
     private byte[] sensorTcpPayloadBuffer = null;
+    private float[] sensorTcpUnitPlaneBuffer = null;
+    private bool sensorTcpUnitPlaneBufferReady = false;
+    private bool sensorTcpUnitPlaneMapSent = false;
     private RawSensorTcpFrame latestSensorTcpFrame = null;
     private readonly object sensorTcpFrameLock = new object();
     private readonly object sensorTcpStatusLock = new object();
     private string sensorTcpStatusMessage = string.Empty;
     private bool sensorTcpStatusDirty = false;
-    private Thread markerTcpThread = null;
-    private SimpleTcpClient markerTcpClient = null;
-    private volatile bool markerTcpRunning = false;
-    private readonly object markerPixelsLock = new object();
-    private List<Vector2> latestMarkerPixels = new List<Vector2>();
-    private bool newMarkerPixelsReceived = false;
-    private readonly object markerCameraRaysUploadLock = new object();
-    private List<MarkerCameraRay> pendingMarkerCameraRaysUpload = new List<MarkerCameraRay>();
-    private bool markerCameraRaysUploadPending = false;
     private readonly object markerWorldPositionsLock = new object();
     private List<Vector3> latestMarkerWorldPositions = new List<Vector3>();
     private bool newMarkerWorldPositionsReceived = false;
@@ -135,7 +127,6 @@ public class ResearchModeController : MonoBehaviour
         // (1) Caching/attaching Unity objects
         ImageTexturesSetup();
         StartSensorTcpThread();
-        StartMarkerTcpThread();
 
         // (2) Reading tool config data from file
         string toolConfigJSONString = ToolConfigJSONSetup();
@@ -290,35 +281,8 @@ public class ResearchModeController : MonoBehaviour
         sensorTcpThread = null;
         latestSensorTcpFrame = null;
         sensorTcpPayloadBuffer = null;
-    }
-
-    private void StartMarkerTcpThread()
-    {
-        if (markerTcpThread != null) return;
-
-        markerTcpRunning = true;
-        markerTcpThread = new Thread(MarkerTcpBackgroundLoop)
-        {
-            IsBackground = true,
-            Name = "DINO IR Marker TCP Receiver"
-        };
-        markerTcpThread.Start();
-    }
-
-    private void StopMarkerTcpThread()
-    {
-        markerTcpRunning = false;
-
-        try { markerTcpClient?.Close(); }
-        catch { }
-
-        if (markerTcpThread != null && markerTcpThread.IsAlive)
-        {
-            markerTcpThread.Join(1000);
-        }
-
-        markerTcpThread = null;
-        markerTcpClient = null;
+        sensorTcpUnitPlaneBufferReady = false;
+        sensorTcpUnitPlaneMapSent = false;
     }
 
     private void SetSensorTcpStatus(string message)
@@ -356,6 +320,7 @@ public class ResearchModeController : MonoBehaviour
         if (depthFrame == null || infraredFrame == null) return;
         if (depthFrame.Length < SensorImagePixelCount || infraredFrame.Length < SensorImagePixelCount) return;
         if (depthToWorldMatrix == null || depthToWorldMatrix.Length < SensorTcpDepthToWorldMatrixValues) return;
+        if (!EnsureSensorTcpUnitPlaneBuffer()) return;
         if (Time.unscaledTime < nextSensorTcpQueueTime) return;
 
         float frameInterval = Mathf.Clamp(sensorTcpFrameIntervalSeconds, 0f, SensorImageUploadIntervalSeconds);
@@ -369,6 +334,8 @@ public class ResearchModeController : MonoBehaviour
             Depth = depthFrame,
             Infrared = infraredFrame,
             DepthToWorldMatrix = matrixCopy,
+            UnitPlaneMap = sensorTcpUnitPlaneBuffer,
+            IncludeUnitPlaneMap = !sensorTcpUnitPlaneMapSent,
             Sequence = ++sensorTcpFrameSequence,
             TimestampUnixSeconds = GetUnixTimeSeconds()
         };
@@ -401,6 +368,39 @@ public class ResearchModeController : MonoBehaviour
         }
     }
 
+    private bool EnsureSensorTcpUnitPlaneBuffer()
+    {
+        if (sensorTcpUnitPlaneBufferReady && sensorTcpUnitPlaneBuffer != null) return true;
+
+#if ENABLE_WINMD_SUPPORT
+        if (researchMode == null) return false;
+
+        int valueCount = SensorImagePixelCount * SensorTcpUnitPlaneValuesPerPixel;
+        if (sensorTcpUnitPlaneBuffer == null || sensorTcpUnitPlaneBuffer.Length != valueCount)
+        {
+            sensorTcpUnitPlaneBuffer = new float[valueCount];
+        }
+
+        int offset = 0;
+        for (int y = 0; y < SensorImageHeight; ++y)
+        {
+            for (int x = 0; x < SensorImageWidth; ++x)
+            {
+                float[] unitPlane = researchMode.MapImagePointToCameraUnitPlane((float)x, (float)y);
+                if (unitPlane == null || unitPlane.Length < SensorTcpUnitPlaneValuesPerPixel) return false;
+
+                sensorTcpUnitPlaneBuffer[offset++] = unitPlane[0];
+                sensorTcpUnitPlaneBuffer[offset++] = unitPlane[1];
+            }
+        }
+
+        sensorTcpUnitPlaneBufferReady = true;
+        return true;
+#else
+        return false;
+#endif
+    }
+
     private void SensorTcpBackgroundLoop()
     {
         while (sensorTcpRunning)
@@ -424,72 +424,35 @@ public class ResearchModeController : MonoBehaviour
                 continue;
             }
 
-            if (!IsOkSensorTcpResponse(response))
+            if (IsErrorSensorTcpResponse(response))
             {
                 string responseText = Encoding.ASCII.GetString(response);
                 DisconnectSensorTcpClient();
                 SetSensorTcpStatus($"TCP connection failed: server returned unexpected response '{responseText}'. Retrying {sensorTcpHost}:{sensorTcpPort} in {GetSensorTcpReconnectIntervalSeconds():0.0}s.");
+                SleepSensorTcpReconnectInterval();
+                continue;
+            }
+
+            try
+            {
+                List<Vector3> markerWorldPositions = ParseServerMarkerWorldResponse(response);
+                lock (markerWorldPositionsLock)
+                {
+                    latestMarkerWorldPositions = markerWorldPositions;
+                    newMarkerWorldPositionsReceived = true;
+                }
+                sensorTcpUnitPlaneMapSent = true;
+            }
+            catch (Exception ex)
+            {
+                DisconnectSensorTcpClient();
+                SetSensorTcpStatus($"TCP marker response parse failed: {ex.Message}. Retrying {sensorTcpHost}:{sensorTcpPort} in {GetSensorTcpReconnectIntervalSeconds():0.0}s.");
                 SleepSensorTcpReconnectInterval();
             }
         }
 
         DisconnectSensorTcpClient();
         sensorTcpPayloadBuffer = null;
-    }
-
-    private void MarkerTcpBackgroundLoop()
-    {
-        while (markerTcpRunning)
-        {
-            if (!EnsureMarkerTcpConnected())
-            {
-                continue;
-            }
-
-            try
-            {
-                if (!UploadPendingMarkerCameraRays())
-                {
-                    string reason = GetSensorTcpErrorReason(markerTcpClient);
-                    DisconnectMarkerTcpClient();
-                    SetSensorTcpStatus($"IR marker TCP failed: {reason}. Retrying {sensorTcpHost}:{sensorTcpPort} in {GetSensorTcpReconnectIntervalSeconds():0.0}s.");
-                    SleepMarkerTcpReconnectInterval();
-                    continue;
-                }
-            }
-            catch (Exception ex)
-            {
-                SetSensorTcpStatus(ex.Message);
-            }
-
-            byte[] response = markerTcpClient.Request(SensorTcpIrMarkersRequest);
-            if (response == null)
-            {
-                string reason = GetSensorTcpErrorReason(markerTcpClient);
-                DisconnectMarkerTcpClient();
-                SetSensorTcpStatus($"IR marker TCP failed: {reason}. Retrying {sensorTcpHost}:{sensorTcpPort} in {GetSensorTcpReconnectIntervalSeconds():0.0}s.");
-                SleepMarkerTcpReconnectInterval();
-                continue;
-            }
-
-            try
-            {
-                List<Vector2> markerPixels = ParseMarkerPixelResponse(response);
-                lock (markerPixelsLock)
-                {
-                    latestMarkerPixels = markerPixels;
-                    newMarkerPixelsReceived = true;
-                }
-            }
-            catch (Exception ex)
-            {
-                SetSensorTcpStatus($"IR marker response parse failed: {ex.Message}");
-            }
-
-            SleepMarkerTcpThread((int)(MarkerPollingIntervalSeconds * 1000f));
-        }
-
-        DisconnectMarkerTcpClient();
     }
 
     private bool EnsureSensorTcpConnected()
@@ -519,30 +482,6 @@ public class ResearchModeController : MonoBehaviour
         return true;
     }
 
-    private bool EnsureMarkerTcpConnected()
-    {
-        if (markerTcpClient != null && markerTcpClient.IsConnected) return true;
-
-        DisconnectMarkerTcpClient();
-
-        string host = sensorTcpHost;
-        int port = sensorTcpPort;
-        float retrySeconds = GetSensorTcpReconnectIntervalSeconds();
-
-        SimpleTcpClient client = new SimpleTcpClient(host, port);
-        if (!client.IsConnected)
-        {
-            string reason = GetSensorTcpErrorReason(client);
-            client.Dispose();
-            SetSensorTcpStatus($"IR marker TCP failed: {reason}. Retrying {host}:{port} in {retrySeconds:0.0}s.");
-            SleepMarkerTcpReconnectInterval();
-            return false;
-        }
-
-        markerTcpClient = client;
-        return true;
-    }
-
     private float GetSensorTcpReconnectIntervalSeconds()
     {
         return Math.Max(0.1f, sensorTcpReconnectIntervalSeconds);
@@ -553,23 +492,12 @@ public class ResearchModeController : MonoBehaviour
         SleepSensorTcpThread((int)(GetSensorTcpReconnectIntervalSeconds() * 1000f));
     }
 
-    private void SleepMarkerTcpReconnectInterval()
-    {
-        SleepMarkerTcpThread((int)(GetSensorTcpReconnectIntervalSeconds() * 1000f));
-    }
-
     private void DisconnectSensorTcpClient()
     {
         try { sensorTcpClient?.Dispose(); }
         catch { }
         sensorTcpClient = null;
-    }
-
-    private void DisconnectMarkerTcpClient()
-    {
-        try { markerTcpClient?.Dispose(); }
-        catch { }
-        markerTcpClient = null;
+        sensorTcpUnitPlaneMapSent = false;
     }
 
     private static string GetSensorTcpErrorReason(SimpleTcpClient client)
@@ -578,9 +506,14 @@ public class ResearchModeController : MonoBehaviour
         return client.LastError;
     }
 
-    private static bool IsOkSensorTcpResponse(byte[] response)
+    private static bool IsErrorSensorTcpResponse(byte[] response)
     {
-        return response != null && response.Length == 2 && response[0] == (byte)'o' && response[1] == (byte)'k';
+        return response != null && response.Length == 5
+            && response[0] == (byte)'e'
+            && response[1] == (byte)'r'
+            && response[2] == (byte)'r'
+            && response[3] == (byte)'o'
+            && response[4] == (byte)'r';
     }
 
     private void SleepSensorTcpThread(int milliseconds)
@@ -594,94 +527,54 @@ public class ResearchModeController : MonoBehaviour
         }
     }
 
-    private void SleepMarkerTcpThread(int milliseconds)
+    private static List<Vector3> ParseServerMarkerWorldResponse(byte[] response)
     {
-        int remaining = Math.Max(0, milliseconds);
-        while (markerTcpRunning && remaining > 0)
+        if (IsBinaryMarkerWorldResponse(response))
         {
-            int sleepNow = Math.Min(remaining, 100);
-            Thread.Sleep(sleepNow);
-            remaining -= sleepNow;
+            return ParseBinaryMarkerWorldResponse(response);
         }
+
+        return ParseJsonMarkerWorldResponse(response);
     }
 
-    private static List<Vector2> ParseMarkerPixelResponse(byte[] response)
+    private static bool IsBinaryMarkerWorldResponse(byte[] response)
     {
-        string json = Encoding.UTF8.GetString(response);
-        JArray markerArray = JArray.Parse(json);
-        List<Vector2> markerPixels = new List<Vector2>();
-
-        foreach (var markerToken in markerArray)
+        if (response == null || response.Length < MarkerWorldResponseMagic.Length) return false;
+        for (int i = 0; i < MarkerWorldResponseMagic.Length; ++i)
         {
-            if (!(markerToken is JArray marker) || marker.Count < 2) continue;
-
-            markerPixels.Add(new Vector2(
-                marker[0].ToObject<float>(),
-                marker[1].ToObject<float>()));
-        }
-
-        return markerPixels;
-    }
-
-    private void QueueMarkerCameraRaysUpload(List<MarkerCameraRay> markerCameraRays)
-    {
-        lock (markerCameraRaysUploadLock)
-        {
-            pendingMarkerCameraRaysUpload = new List<MarkerCameraRay>(markerCameraRays);
-            markerCameraRaysUploadPending = true;
-        }
-    }
-
-    private bool UploadPendingMarkerCameraRays()
-    {
-        List<MarkerCameraRay> markerCameraRays;
-        lock (markerCameraRaysUploadLock)
-        {
-            if (!markerCameraRaysUploadPending) return true;
-
-            markerCameraRays = new List<MarkerCameraRay>(pendingMarkerCameraRaysUpload);
-            markerCameraRaysUploadPending = false;
-        }
-
-        byte[] payload = BuildMarkerCameraRaysPayload(markerCameraRays);
-        byte[] response = markerTcpClient.Request(payload);
-        if (response == null)
-        {
-            lock (markerCameraRaysUploadLock)
-            {
-                pendingMarkerCameraRaysUpload = markerCameraRays;
-                markerCameraRaysUploadPending = true;
-            }
-
-            return false;
-        }
-
-        List<Vector3> markerWorldPositions = ParseServerMarkerWorldResponse(response);
-        lock (markerWorldPositionsLock)
-        {
-            latestMarkerWorldPositions = markerWorldPositions;
-            newMarkerWorldPositionsReceived = true;
+            if (response[i] != MarkerWorldResponseMagic[i]) return false;
         }
 
         return true;
     }
 
-    private static byte[] BuildMarkerCameraRaysPayload(List<MarkerCameraRay> markerCameraRays)
+    private static List<Vector3> ParseBinaryMarkerWorldResponse(byte[] response)
     {
-        JArray raysJson = new JArray();
-        foreach (var ray in markerCameraRays)
+        const int headerBytes = 12;
+        const int pointBytes = 12;
+        if (response.Length < headerBytes) throw new ArgumentException("Marker response is too short.");
+
+        int offset = MarkerWorldResponseMagic.Length;
+        uint count = ReadUInt32LittleEndian(response, ref offset);
+        int expectedLength = headerBytes + checked((int)count * pointBytes);
+        if (response.Length != expectedLength)
         {
-            raysJson.Add(new JArray(ray.Pixel.x, ray.Pixel.y, ray.UnitPlane.x, ray.UnitPlane.y));
+            throw new ArgumentException($"Marker response size mismatch: got {response.Length}, expected {expectedLength}.");
         }
 
-        byte[] jsonPayload = Encoding.UTF8.GetBytes(raysJson.ToString(Newtonsoft.Json.Formatting.None));
-        byte[] payload = new byte[SensorTcpIrMarkerRaysPrefix.Length + jsonPayload.Length];
-        Buffer.BlockCopy(SensorTcpIrMarkerRaysPrefix, 0, payload, 0, SensorTcpIrMarkerRaysPrefix.Length);
-        Buffer.BlockCopy(jsonPayload, 0, payload, SensorTcpIrMarkerRaysPrefix.Length, jsonPayload.Length);
-        return payload;
+        List<Vector3> markerWorldPositions = new List<Vector3>((int)count);
+        for (int i = 0; i < count; ++i)
+        {
+            float x = ReadFloatLittleEndian(response, ref offset);
+            float y = ReadFloatLittleEndian(response, ref offset);
+            float z = ReadFloatLittleEndian(response, ref offset);
+            markerWorldPositions.Add(new Vector3(x, y, -z));
+        }
+
+        return markerWorldPositions;
     }
 
-    private static List<Vector3> ParseServerMarkerWorldResponse(byte[] response)
+    private static List<Vector3> ParseJsonMarkerWorldResponse(byte[] response)
     {
         string json = Encoding.UTF8.GetString(response);
         JArray markerArray = JArray.Parse(json);
@@ -705,7 +598,9 @@ public class ResearchModeController : MonoBehaviour
         int depthByteLength = SensorImagePixelCount * sizeof(ushort);
         int infraredByteLength = SensorImagePixelCount * sizeof(ushort);
         int matrixByteLength = SensorTcpDepthToWorldMatrixValues * sizeof(double);
-        int payloadLength = SensorTcpRawStreamPrefix.Length + SensorTcpHeaderV2BaseBytes + matrixByteLength + depthByteLength + infraredByteLength;
+        int unitPlaneCount = frame.IncludeUnitPlaneMap ? SensorImagePixelCount : 0;
+        int unitPlaneByteLength = unitPlaneCount * SensorTcpUnitPlaneValuesPerPixel * sizeof(float);
+        int payloadLength = SensorTcpRawStreamPrefix.Length + SensorTcpHeaderV4BaseBytes + matrixByteLength + unitPlaneByteLength + depthByteLength + infraredByteLength;
         if (payload == null || payload.Length != payloadLength)
         {
             payload = new byte[payloadLength];
@@ -722,10 +617,35 @@ public class ResearchModeController : MonoBehaviour
         WriteInt32(payload, ref offset, SensorImagePixelCount);
         WriteInt32(payload, ref offset, SensorImagePixelCount);
         WriteInt32(payload, ref offset, SensorTcpDepthToWorldMatrixValues);
+        WriteInt32(payload, ref offset, unitPlaneCount);
 
-        foreach (double matrixValue in frame.DepthToWorldMatrix)
+        if (BitConverter.IsLittleEndian)
         {
-            WriteDouble(payload, ref offset, matrixValue);
+            Buffer.BlockCopy(frame.DepthToWorldMatrix, 0, payload, offset, matrixByteLength);
+            offset += matrixByteLength;
+        }
+        else
+        {
+            foreach (double matrixValue in frame.DepthToWorldMatrix)
+            {
+                WriteDouble(payload, ref offset, matrixValue);
+            }
+        }
+
+        if (frame.IncludeUnitPlaneMap)
+        {
+            if (BitConverter.IsLittleEndian)
+            {
+                Buffer.BlockCopy(frame.UnitPlaneMap, 0, payload, offset, unitPlaneByteLength);
+                offset += unitPlaneByteLength;
+            }
+            else
+            {
+                foreach (float unitPlaneValue in frame.UnitPlaneMap)
+                {
+                    WriteFloat(payload, ref offset, unitPlaneValue);
+                }
+            }
         }
 
         Buffer.BlockCopy(frame.Depth, 0, payload, offset, depthByteLength);
@@ -743,65 +663,86 @@ public class ResearchModeController : MonoBehaviour
 
     private static void WriteInt32(byte[] target, ref int offset, int value)
     {
-        WriteLittleEndianBytes(target, ref offset, BitConverter.GetBytes(value));
+        unchecked
+        {
+            target[offset++] = (byte)value;
+            target[offset++] = (byte)(value >> 8);
+            target[offset++] = (byte)(value >> 16);
+            target[offset++] = (byte)(value >> 24);
+        }
     }
 
     private static void WriteUInt64(byte[] target, ref int offset, ulong value)
     {
-        WriteLittleEndianBytes(target, ref offset, BitConverter.GetBytes(value));
+        target[offset++] = (byte)value;
+        target[offset++] = (byte)(value >> 8);
+        target[offset++] = (byte)(value >> 16);
+        target[offset++] = (byte)(value >> 24);
+        target[offset++] = (byte)(value >> 32);
+        target[offset++] = (byte)(value >> 40);
+        target[offset++] = (byte)(value >> 48);
+        target[offset++] = (byte)(value >> 56);
     }
 
     private static void WriteDouble(byte[] target, ref int offset, double value)
     {
-        WriteLittleEndianBytes(target, ref offset, BitConverter.GetBytes(value));
+        WriteUInt64(target, ref offset, (ulong)BitConverter.DoubleToInt64Bits(value));
     }
 
-    private static void WriteLittleEndianBytes(byte[] target, ref int offset, byte[] value)
+    private static void WriteFloat(byte[] target, ref int offset, float value)
     {
-        if (!BitConverter.IsLittleEndian) Array.Reverse(value);
-        Buffer.BlockCopy(value, 0, target, offset, value.Length);
-        offset += value.Length;
+        byte[] valueBytes = BitConverter.GetBytes(value);
+        if (BitConverter.IsLittleEndian)
+        {
+            target[offset++] = valueBytes[0];
+            target[offset++] = valueBytes[1];
+            target[offset++] = valueBytes[2];
+            target[offset++] = valueBytes[3];
+        }
+        else
+        {
+            target[offset++] = valueBytes[3];
+            target[offset++] = valueBytes[2];
+            target[offset++] = valueBytes[1];
+            target[offset++] = valueBytes[0];
+        }
+    }
+
+    private static uint ReadUInt32LittleEndian(byte[] source, ref int offset)
+    {
+        uint value = (uint)(
+            source[offset]
+            | (source[offset + 1] << 8)
+            | (source[offset + 2] << 16)
+            | (source[offset + 3] << 24));
+        offset += 4;
+        return value;
+    }
+
+    private static float ReadFloatLittleEndian(byte[] source, ref int offset)
+    {
+        if (BitConverter.IsLittleEndian)
+        {
+            float value = BitConverter.ToSingle(source, offset);
+            offset += 4;
+            return value;
+        }
+
+        byte[] valueBytes = new byte[]
+        {
+            source[offset + 3],
+            source[offset + 2],
+            source[offset + 1],
+            source[offset]
+        };
+        offset += 4;
+        return BitConverter.ToSingle(valueBytes, 0);
     }
 
     private static double GetUnixTimeSeconds()
     {
         DateTime unixEpoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
         return (DateTime.UtcNow - unixEpoch).TotalSeconds;
-    }
-
-    private void ApplyLatestMarkerPixels()
-    {
-        List<Vector2> markerPixels = null;
-        lock (markerPixelsLock)
-        {
-            if (!newMarkerPixelsReceived) return;
-
-            markerPixels = new List<Vector2>(latestMarkerPixels);
-            newMarkerPixelsReceived = false;
-        }
-
-        QueueMarkerCameraRaysUpload(ResolveMarkerCameraRays(markerPixels));
-    }
-
-    private List<MarkerCameraRay> ResolveMarkerCameraRays(List<Vector2> markerPixels)
-    {
-        List<MarkerCameraRay> markerCameraRays = new List<MarkerCameraRay>();
-#if ENABLE_WINMD_SUPPORT
-        if (researchMode == null || markerPixels == null) return markerCameraRays;
-
-        foreach (var markerPixel in markerPixels)
-        {
-            float[] unitPlane = researchMode.MapImagePointToCameraUnitPlane(markerPixel.x, markerPixel.y);
-            if (unitPlane == null || unitPlane.Length < 2) continue;
-
-            markerCameraRays.Add(new MarkerCameraRay
-            {
-                Pixel = markerPixel,
-                UnitPlane = new Vector2(unitPlane[0], unitPlane[1])
-            });
-        }
-#endif
-        return markerCameraRays;
     }
 
     private void ApplyLatestMarkerWorldPositions()
@@ -924,7 +865,6 @@ public class ResearchModeController : MonoBehaviour
         GrabLatestSensorImages();
         GrabLatestToolDictionary();
 #endif
-        ApplyLatestMarkerPixels();
         ApplyLatestMarkerWorldPositions();
         ApplySensorTcpStatusToScreen();
     }
@@ -996,7 +936,6 @@ public class ResearchModeController : MonoBehaviour
     private void OnDestroy()
     {
         StopSensorTcpThread();
-        StopMarkerTcpThread();
     }
 
     /// <summary>
@@ -1045,14 +984,10 @@ public class ResearchModeController : MonoBehaviour
         public ushort[] Depth;
         public ushort[] Infrared;
         public double[] DepthToWorldMatrix;
+        public float[] UnitPlaneMap;
+        public bool IncludeUnitPlaneMap;
         public ulong Sequence;
         public double TimestampUnixSeconds;
-    }
-
-    private struct MarkerCameraRay
-    {
-        public Vector2 Pixel;
-        public Vector2 UnitPlane;
     }
 
 }
