@@ -20,13 +20,28 @@ DEFAULT_HOST = "169.254.83.86"
 DEFAULT_PORT = 8888
 DEFAULT_WIDTH = 512
 DEFAULT_HEIGHT = 512
-DEFAULT_DETECTOR = "blob"
-DEFAULT_BLOB_THRESHOLD_PERCENTILE = 99.7
-DEFAULT_BLOB_MIN_THRESHOLD = 0
-DEFAULT_BLOB_MIN_AREA = 6
-DEFAULT_BLOB_MAX_AREA = 3000
-DEFAULT_BLOB_MAX_MARKERS = 16
+DEFAULT_DETECTOR = "threshold"
+DEFAULT_THRESHOLD_CONFIDENCE_THRESHOLD = 0.25
+DEFAULT_THRESHOLD_PERCENTILE = 99.7
+DEFAULT_THRESHOLD_MIN_THRESHOLD = 0
+DEFAULT_THRESHOLD_MIN_AREA = 6
+DEFAULT_THRESHOLD_MAX_AREA = 3000
+DEFAULT_THRESHOLD_MIN_CIRCULARITY = 0.15
+DEFAULT_THRESHOLD_MIN_ASPECT_RATIO = 0.25
+DEFAULT_THRESHOLD_MAX_ASPECT_RATIO = 4.0
+DEFAULT_THRESHOLD_MIN_WIDTH = 1
+DEFAULT_THRESHOLD_MIN_HEIGHT = 1
+DEFAULT_THRESHOLD_MORPHOLOGY_KERNEL_SIZE = 0
+DEFAULT_THRESHOLD_MORPHOLOGY_OPEN_ITERATIONS = 0
+DEFAULT_THRESHOLD_MAX_MARKERS = 16
 SERVER_CONFIG_PATH = Path(__file__).with_name("RawSensorImageServerConfig.json")
+
+
+def _normalize_detector_name(detector: str) -> str:
+    normalized = detector.lower()
+    if normalized == "blob":
+        return "threshold"
+    return normalized
 
 
 def load_server_config(config_path: Path = SERVER_CONFIG_PATH) -> dict[str, str | int | float]:
@@ -36,11 +51,19 @@ def load_server_config(config_path: Path = SERVER_CONFIG_PATH) -> dict[str, str 
         "width": DEFAULT_WIDTH,
         "height": DEFAULT_HEIGHT,
         "detector": DEFAULT_DETECTOR,
-        "blob_threshold_percentile": DEFAULT_BLOB_THRESHOLD_PERCENTILE,
-        "blob_min_threshold": DEFAULT_BLOB_MIN_THRESHOLD,
-        "blob_min_area": DEFAULT_BLOB_MIN_AREA,
-        "blob_max_area": DEFAULT_BLOB_MAX_AREA,
-        "blob_max_markers": DEFAULT_BLOB_MAX_MARKERS,
+        "threshold_confidence_threshold": DEFAULT_THRESHOLD_CONFIDENCE_THRESHOLD,
+        "threshold_percentile": DEFAULT_THRESHOLD_PERCENTILE,
+        "threshold_min_threshold": DEFAULT_THRESHOLD_MIN_THRESHOLD,
+        "threshold_min_area": DEFAULT_THRESHOLD_MIN_AREA,
+        "threshold_max_area": DEFAULT_THRESHOLD_MAX_AREA,
+        "threshold_min_circularity": DEFAULT_THRESHOLD_MIN_CIRCULARITY,
+        "threshold_min_aspect_ratio": DEFAULT_THRESHOLD_MIN_ASPECT_RATIO,
+        "threshold_max_aspect_ratio": DEFAULT_THRESHOLD_MAX_ASPECT_RATIO,
+        "threshold_min_width": DEFAULT_THRESHOLD_MIN_WIDTH,
+        "threshold_min_height": DEFAULT_THRESHOLD_MIN_HEIGHT,
+        "threshold_morphology_kernel_size": DEFAULT_THRESHOLD_MORPHOLOGY_KERNEL_SIZE,
+        "threshold_morphology_open_iterations": DEFAULT_THRESHOLD_MORPHOLOGY_OPEN_ITERATIONS,
+        "threshold_max_markers": DEFAULT_THRESHOLD_MAX_MARKERS,
     }
     if not config_path.exists():
         return defaults
@@ -56,14 +79,45 @@ def load_server_config(config_path: Path = SERVER_CONFIG_PATH) -> dict[str, str 
         "port": int(config.get("port", defaults["port"])),
         "width": int(config.get("width", defaults["width"])),
         "height": int(config.get("height", defaults["height"])),
-        "detector": str(config.get("detector", defaults["detector"])).lower(),
-        "blob_threshold_percentile": float(
-            config.get("blob_threshold_percentile", defaults["blob_threshold_percentile"])
+        "detector": _normalize_detector_name(str(config.get("detector", defaults["detector"]))),
+        "threshold_confidence_threshold": float(
+            config.get("threshold_confidence_threshold", defaults["threshold_confidence_threshold"])
         ),
-        "blob_min_threshold": int(config.get("blob_min_threshold", defaults["blob_min_threshold"])),
-        "blob_min_area": int(config.get("blob_min_area", defaults["blob_min_area"])),
-        "blob_max_area": int(config.get("blob_max_area", defaults["blob_max_area"])),
-        "blob_max_markers": int(config.get("blob_max_markers", defaults["blob_max_markers"])),
+        "threshold_percentile": float(
+            config.get(
+                "threshold_percentile",
+                config.get("blob_threshold_percentile", defaults["threshold_percentile"]),
+            )
+        ),
+        "threshold_min_threshold": int(
+            config.get("threshold_min_threshold", config.get("blob_min_threshold", defaults["threshold_min_threshold"]))
+        ),
+        "threshold_min_area": int(
+            config.get("threshold_min_area", config.get("blob_min_area", defaults["threshold_min_area"]))
+        ),
+        "threshold_max_area": int(
+            config.get("threshold_max_area", config.get("blob_max_area", defaults["threshold_max_area"]))
+        ),
+        "threshold_min_circularity": float(
+            config.get("threshold_min_circularity", defaults["threshold_min_circularity"])
+        ),
+        "threshold_min_aspect_ratio": float(
+            config.get("threshold_min_aspect_ratio", defaults["threshold_min_aspect_ratio"])
+        ),
+        "threshold_max_aspect_ratio": float(
+            config.get("threshold_max_aspect_ratio", defaults["threshold_max_aspect_ratio"])
+        ),
+        "threshold_min_width": int(config.get("threshold_min_width", defaults["threshold_min_width"])),
+        "threshold_min_height": int(config.get("threshold_min_height", defaults["threshold_min_height"])),
+        "threshold_morphology_kernel_size": int(
+            config.get("threshold_morphology_kernel_size", defaults["threshold_morphology_kernel_size"])
+        ),
+        "threshold_morphology_open_iterations": int(
+            config.get("threshold_morphology_open_iterations", defaults["threshold_morphology_open_iterations"])
+        ),
+        "threshold_max_markers": int(
+            config.get("threshold_max_markers", config.get("blob_max_markers", defaults["threshold_max_markers"]))
+        ),
     }
     if loaded_config["port"] <= 0:
         raise ValueError(f"Server config port must be positive: {loaded_config['port']}")
@@ -71,12 +125,63 @@ def load_server_config(config_path: Path = SERVER_CONFIG_PATH) -> dict[str, str 
         raise ValueError(
             f"Server config image size must be positive: {loaded_config['width']}x{loaded_config['height']}"
         )
-    if loaded_config["detector"] not in ("blob", "yolo"):
-        raise ValueError(f"Server config detector must be 'blob' or 'yolo': {loaded_config['detector']}")
-    if not 0.0 <= loaded_config["blob_threshold_percentile"] <= 100.0:
+    if loaded_config["detector"] not in ("threshold", "yolo"):
+        raise ValueError(f"Server config detector must be 'threshold' or 'yolo': {loaded_config['detector']}")
+    if not 0.0 <= loaded_config["threshold_confidence_threshold"] <= 1.0:
         raise ValueError(
-            "Server config blob_threshold_percentile must be between 0 and 100: "
-            f"{loaded_config['blob_threshold_percentile']}"
+            "Server config threshold_confidence_threshold must be between 0 and 1: "
+            f"{loaded_config['threshold_confidence_threshold']}"
+        )
+    if not 0.0 <= loaded_config["threshold_percentile"] <= 100.0:
+        raise ValueError(
+            "Server config threshold_percentile must be between 0 and 100: "
+            f"{loaded_config['threshold_percentile']}"
+        )
+    if loaded_config["threshold_min_threshold"] < 0:
+        raise ValueError(
+            "Server config threshold_min_threshold must be non-negative: "
+            f"{loaded_config['threshold_min_threshold']}"
+        )
+    if (
+        loaded_config["threshold_min_area"] <= 0
+        or loaded_config["threshold_max_area"] < loaded_config["threshold_min_area"]
+    ):
+        raise ValueError(
+            "Server config threshold area bounds must satisfy 0 < min <= max: "
+            f"{loaded_config['threshold_min_area']}..{loaded_config['threshold_max_area']}"
+        )
+    if loaded_config["threshold_min_circularity"] < 0.0:
+        raise ValueError(
+            "Server config threshold_min_circularity must be non-negative: "
+            f"{loaded_config['threshold_min_circularity']}"
+        )
+    if (
+        loaded_config["threshold_min_aspect_ratio"] <= 0.0
+        or loaded_config["threshold_max_aspect_ratio"] < loaded_config["threshold_min_aspect_ratio"]
+    ):
+        raise ValueError(
+            "Server config threshold aspect ratio bounds must satisfy 0 < min <= max: "
+            f"{loaded_config['threshold_min_aspect_ratio']}..{loaded_config['threshold_max_aspect_ratio']}"
+        )
+    if loaded_config["threshold_min_width"] <= 0 or loaded_config["threshold_min_height"] <= 0:
+        raise ValueError(
+            "Server config threshold minimum dimensions must be positive: "
+            f"{loaded_config['threshold_min_width']}x{loaded_config['threshold_min_height']}"
+        )
+    if loaded_config["threshold_morphology_kernel_size"] < 0:
+        raise ValueError(
+            "Server config threshold_morphology_kernel_size must be non-negative: "
+            f"{loaded_config['threshold_morphology_kernel_size']}"
+        )
+    if loaded_config["threshold_morphology_open_iterations"] < 0:
+        raise ValueError(
+            "Server config threshold_morphology_open_iterations must be non-negative: "
+            f"{loaded_config['threshold_morphology_open_iterations']}"
+        )
+    if loaded_config["threshold_max_markers"] < 0:
+        raise ValueError(
+            "Server config threshold_max_markers must be non-negative: "
+            f"{loaded_config['threshold_max_markers']}"
         )
 
     return loaded_config
@@ -89,15 +194,23 @@ WIDTH = int(SERVER_CONFIG["width"])
 HEIGHT = int(SERVER_CONFIG["height"])
 PIXEL_COUNT = WIDTH * HEIGHT
 DETECTOR = str(SERVER_CONFIG["detector"])
-BLOB_THRESHOLD_PERCENTILE = float(SERVER_CONFIG["blob_threshold_percentile"])
-BLOB_MIN_THRESHOLD = int(SERVER_CONFIG["blob_min_threshold"])
-BLOB_MIN_AREA = int(SERVER_CONFIG["blob_min_area"])
-BLOB_MAX_AREA = int(SERVER_CONFIG["blob_max_area"])
-BLOB_MAX_MARKERS = int(SERVER_CONFIG["blob_max_markers"])
+THRESHOLD_CONFIDENCE_THRESHOLD = float(SERVER_CONFIG["threshold_confidence_threshold"])
+THRESHOLD_PERCENTILE = float(SERVER_CONFIG["threshold_percentile"])
+THRESHOLD_MIN_THRESHOLD = int(SERVER_CONFIG["threshold_min_threshold"])
+THRESHOLD_MIN_AREA = int(SERVER_CONFIG["threshold_min_area"])
+THRESHOLD_MAX_AREA = int(SERVER_CONFIG["threshold_max_area"])
+THRESHOLD_MIN_CIRCULARITY = float(SERVER_CONFIG["threshold_min_circularity"])
+THRESHOLD_MIN_ASPECT_RATIO = float(SERVER_CONFIG["threshold_min_aspect_ratio"])
+THRESHOLD_MAX_ASPECT_RATIO = float(SERVER_CONFIG["threshold_max_aspect_ratio"])
+THRESHOLD_MIN_WIDTH = int(SERVER_CONFIG["threshold_min_width"])
+THRESHOLD_MIN_HEIGHT = int(SERVER_CONFIG["threshold_min_height"])
+THRESHOLD_MORPHOLOGY_KERNEL_SIZE = int(SERVER_CONFIG["threshold_morphology_kernel_size"])
+THRESHOLD_MORPHOLOGY_OPEN_ITERATIONS = int(SERVER_CONFIG["threshold_morphology_open_iterations"])
+THRESHOLD_MAX_MARKERS = int(SERVER_CONFIG["threshold_max_markers"])
 
 import cv2
 import numpy as np
-from ir_yolo_tracker import IRMarkerTracker, MarkerDetection, create_tracker, draw_detections
+from ir_yolo_tracker import IRMarkerTracker, MarkerDetection, ThresholdMarkerDetector, create_tracker, draw_detections
 from simple_tcp_server import SimpleTcpServer
 
 RAW_STREAM_PREFIX = b"raw_stream:"
@@ -109,13 +222,12 @@ HEADER_V1_STRUCT = struct.Struct("<8siiQdii")
 HEADER_V2_STRUCT = struct.Struct("<8siiQdiii")
 HEADER_V3_STRUCT = struct.Struct("<8siiQdiiii")
 HEADER_V4_STRUCT = struct.Struct("<8siiQdiiii")
-COORD_RESPONSE_MAGIC = b"DINOXYZ1"
-COORD_RESPONSE_HEADER_STRUCT = struct.Struct("<8sI")
-COORD_RESPONSE_POINT_STRUCT = struct.Struct("<fff")
+MARKER_PIXEL_RESPONSE_MAGIC = b"DINOUV01"
+MARKER_PIXEL_RESPONSE_HEADER_STRUCT = struct.Struct("<8sI")
+MARKER_PIXEL_RESPONSE_POINT_STRUCT = struct.Struct("<ff")
 DEPTH_TO_WORLD_MATRIX_VALUES = 16
 DEPTH_MIN_MM = 1
 DEPTH_MAX_MM = 4090
-MARKER_SPHERE_RADIUS_METRES = 0.005
 WINDOW_NAME = "DINO Raw Sensor Stream"
 SHUTDOWN_MESSAGE = "Shutdown requested. Closing raw sensor server..."
 VISUALIZATION_INTERVAL_SECONDS = 1.0 / 30.0
@@ -148,7 +260,8 @@ class SharedState:
     latest_frame: SensorFrame | None = None
     receive_fps: float = 0.0
     average_yolo_marker_ms: float = 0.0
-    average_coordinate_ms: float = 0.0
+    last_response_latency_ms: float = 0.0
+    average_response_latency_ms: float = 0.0
     last_error: str = ""
 
 
@@ -158,11 +271,14 @@ class RawSensorTcpServer(SimpleTcpServer):
         *args,
         state: SharedState | None = None,
         on_disconnect=None,
+        print_response_latency: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.state = state
         self.on_disconnect = on_disconnect
+        self.print_response_latency = print_response_latency
+        self.response_latency_samples: deque[float] = deque(maxlen=PROCESSING_AVERAGE_SAMPLE_COUNT)
 
     def _handle(self, conn, addr) -> None:
         connected = datetime.now()
@@ -181,6 +297,30 @@ class RawSensorTcpServer(SimpleTcpServer):
         if self.on_disconnect is not None:
             self.on_disconnect()
         super()._conn_close(addr)
+
+    def _calc_and_resp(self, addr, msg_now: bytes) -> bool:
+        response_start = time.perf_counter()
+        died = super()._calc_and_resp(addr, msg_now)
+        if died or msg_now == self.quit_token:
+            return died
+
+        latency_ms = (time.perf_counter() - response_start) * 1000.0
+        self.response_latency_samples.append(latency_ms)
+        average_latency_ms = sum(self.response_latency_samples) / len(self.response_latency_samples)
+        if self.state is not None:
+            with self.state.lock:
+                self.state.last_response_latency_ms = latency_ms
+                self.state.average_response_latency_ms = average_latency_ms
+                self.state.lock.notify_all()
+
+        if self.print_response_latency:
+            print(
+                f"response_sent addr={addr[0]}:{addr[1]} "
+                f"server_latency_ms={latency_ms:.2f} avg_server_latency_ms={average_latency_ms:.2f}",
+                flush=True,
+            )
+
+        return died
 
 
 class FpsCounter:
@@ -220,64 +360,27 @@ class RollingAverage:
             self.samples.clear()
 
 
-class BlobMarkerTracker:
-    def __init__(
-        self,
-        *,
-        threshold_percentile: float = BLOB_THRESHOLD_PERCENTILE,
-        min_threshold: int = BLOB_MIN_THRESHOLD,
-        min_area: int = BLOB_MIN_AREA,
-        max_area: int = BLOB_MAX_AREA,
-        max_markers: int = BLOB_MAX_MARKERS,
-    ) -> None:
-        self.threshold_percentile = threshold_percentile
-        self.min_threshold = min_threshold
-        self.min_area = min_area
-        self.max_area = max_area
-        self.max_markers = max_markers
-
-    def detect(self, frame: np.ndarray) -> list[MarkerDetection]:
-        threshold_index = int((self.threshold_percentile / 100.0) * (frame.size - 1))
-        threshold = max(self.min_threshold, int(np.partition(frame.ravel(), threshold_index)[threshold_index]))
-        _, mask = cv2.threshold(frame, threshold, 255, cv2.THRESH_BINARY)
-        mask8 = mask.astype(np.uint8, copy=False)
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask8, connectivity=8)
-
-        detections: list[MarkerDetection] = []
-        for label_index in range(1, num_labels):
-            area = int(stats[label_index, cv2.CC_STAT_AREA])
-            if area < self.min_area or area > self.max_area:
-                continue
-
-            x = int(stats[label_index, cv2.CC_STAT_LEFT])
-            y = int(stats[label_index, cv2.CC_STAT_TOP])
-            width = int(stats[label_index, cv2.CC_STAT_WIDTH])
-            height = int(stats[label_index, cv2.CC_STAT_HEIGHT])
-            if width <= 0 or height <= 0:
-                continue
-
-            fill_ratio = area / float(width * height)
-            if fill_ratio < 0.35:
-                continue
-
-            detections.append(
-                MarkerDetection(
-                    bbox_xyxy=(float(x), float(y), float(x + width - 1), float(y + height - 1)),
-                    confidence=min(1.0, area / max(1.0, float(self.max_area))),
-                )
-            )
-
-        detections.sort(key=lambda detection: detection.confidence, reverse=True)
-        if self.max_markers > 0:
-            detections = detections[: self.max_markers]
-        return detections
-
-
-def create_marker_tracker(detector: str):
+def create_marker_tracker(detector: str) -> IRMarkerTracker | ThresholdMarkerDetector:
+    detector = _normalize_detector_name(detector)
     if detector == "yolo":
         return create_tracker()
-    if detector == "blob":
-        return BlobMarkerTracker()
+    if detector == "threshold":
+        max_detections = None if THRESHOLD_MAX_MARKERS <= 0 else THRESHOLD_MAX_MARKERS
+        return ThresholdMarkerDetector(
+            confidence_threshold=THRESHOLD_CONFIDENCE_THRESHOLD,
+            threshold_percentile=THRESHOLD_PERCENTILE,
+            minimum_threshold=THRESHOLD_MIN_THRESHOLD,
+            min_area=THRESHOLD_MIN_AREA,
+            max_area=THRESHOLD_MAX_AREA,
+            min_circularity=THRESHOLD_MIN_CIRCULARITY,
+            min_aspect_ratio=THRESHOLD_MIN_ASPECT_RATIO,
+            max_aspect_ratio=THRESHOLD_MAX_ASPECT_RATIO,
+            min_width=THRESHOLD_MIN_WIDTH,
+            min_height=THRESHOLD_MIN_HEIGHT,
+            morphology_kernel_size=THRESHOLD_MORPHOLOGY_KERNEL_SIZE,
+            morphology_open_iterations=THRESHOLD_MORPHOLOGY_OPEN_ITERATIONS,
+            max_detections=max_detections,
+        )
     raise ValueError(f"Unsupported detector: {detector}")
 
 
@@ -388,7 +491,8 @@ def clear_connection_frame(state: SharedState) -> None:
         state.latest_frame = None
         state.receive_fps = 0.0
         state.average_yolo_marker_ms = 0.0
-        state.average_coordinate_ms = 0.0
+        state.last_response_latency_ms = 0.0
+        state.average_response_latency_ms = 0.0
         state.last_error = ""
         state.lock.notify_all()
 
@@ -527,7 +631,7 @@ def parse_sensor_images_v3(message: bytes | memoryview) -> tuple[np.ndarray, np.
 def parse_sensor_images_v4(
     message: bytes | memoryview,
     cached_unit_plane_map: np.ndarray | None,
-) -> tuple[np.ndarray, np.ndarray, int, float, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, int, float, np.ndarray, np.ndarray | None]:
     (
         magic,
         width,
@@ -568,8 +672,6 @@ def parse_sensor_images_v4(
             (height, width, 2)
         )
     else:
-        if cached_unit_plane_map is None:
-            raise ValueError("DINOIMG4 frame omitted unit-plane map before one was cached")
         unit_plane_map = cached_unit_plane_map
     offset += unit_plane_bytes
     depth = np.frombuffer(message, dtype="<u2", count=depth_count, offset=offset).reshape((height, width))
@@ -610,145 +712,22 @@ def detect_infrared_markers(
     return detections, elapsed_ms
 
 
-def bilinear_depth_at(depth: np.ndarray, pixel_x: float, pixel_y: float) -> float:
-    x = float(np.clip(pixel_x, 0.0, WIDTH - 1.0))
-    y = float(np.clip(pixel_y, 0.0, HEIGHT - 1.0))
-    x0 = int(np.floor(x))
-    y0 = int(np.floor(y))
-    x1 = min(x0 + 1, WIDTH - 1)
-    y1 = min(y0 + 1, HEIGHT - 1)
-    wx = x - x0
-    wy = y - y0
-
-    d00 = float(depth[y0, x0])
-    d10 = float(depth[y0, x1])
-    d01 = float(depth[y1, x0])
-    d11 = float(depth[y1, x1])
-    return (
-        d00 * (1.0 - wx) * (1.0 - wy)
-        + d10 * wx * (1.0 - wy)
-        + d01 * (1.0 - wx) * wy
-        + d11 * wx * wy
+def serialize_marker_pixels(marker_detections: list[MarkerDetection]) -> bytes:
+    response = bytearray(
+        MARKER_PIXEL_RESPONSE_HEADER_STRUCT.size
+        + len(marker_detections) * MARKER_PIXEL_RESPONSE_POINT_STRUCT.size
     )
-
-
-def bilinear_unit_plane_at(unit_plane_map: np.ndarray, pixel_x: float, pixel_y: float) -> tuple[float, float]:
-    x = float(np.clip(pixel_x, 0.0, WIDTH - 1.0))
-    y = float(np.clip(pixel_y, 0.0, HEIGHT - 1.0))
-    x0 = int(np.floor(x))
-    y0 = int(np.floor(y))
-    x1 = min(x0 + 1, WIDTH - 1)
-    y1 = min(y0 + 1, HEIGHT - 1)
-    wx = x - x0
-    wy = y - y0
-
-    p00 = unit_plane_map[y0, x0]
-    p10 = unit_plane_map[y0, x1]
-    p01 = unit_plane_map[y1, x0]
-    p11 = unit_plane_map[y1, x1]
-    unit_plane = (
-        p00 * (1.0 - wx) * (1.0 - wy)
-        + p10 * wx * (1.0 - wy)
-        + p01 * (1.0 - wx) * wy
-        + p11 * wx * wy
-    )
-    return float(unit_plane[0]), float(unit_plane[1])
-
-
-def marker_pixel_to_world(
-    depth: np.ndarray,
-    depth_to_world_matrix: np.ndarray,
-    unit_plane_map: np.ndarray,
-    marker_detection: MarkerDetection,
-) -> list[float] | None:
-    pixel_x, pixel_y = marker_detection.center_xy
-    unit_plane_x, unit_plane_y = bilinear_unit_plane_at(unit_plane_map, pixel_x, pixel_y)
-    depth_value = bilinear_depth_at(depth, pixel_x, pixel_y)
-    if depth_value <= 0.0 or depth_value > DEPTH_MAX_MM:
-        return None
-
-    ray_norm = (unit_plane_x * unit_plane_x + unit_plane_y * unit_plane_y + 1.0) ** 0.5
-    if ray_norm <= 0.0:
-        return None
-
-    depth_metres = depth_value / 1000.0
-    point_x = unit_plane_x * depth_metres / ray_norm
-    point_y = unit_plane_y * depth_metres / ray_norm
-    point_z = depth_metres / ray_norm
-
-    world_x = (
-        float(depth_to_world_matrix[0, 0]) * point_x
-        + float(depth_to_world_matrix[0, 1]) * point_y
-        + float(depth_to_world_matrix[0, 2]) * point_z
-        + float(depth_to_world_matrix[0, 3])
-    )
-    world_y = (
-        float(depth_to_world_matrix[1, 0]) * point_x
-        + float(depth_to_world_matrix[1, 1]) * point_y
-        + float(depth_to_world_matrix[1, 2]) * point_z
-        + float(depth_to_world_matrix[1, 3])
-    )
-    world_z = (
-        float(depth_to_world_matrix[2, 0]) * point_x
-        + float(depth_to_world_matrix[2, 1]) * point_y
-        + float(depth_to_world_matrix[2, 2]) * point_z
-        + float(depth_to_world_matrix[2, 3])
-    )
-
-    outward_x = world_x - float(depth_to_world_matrix[0, 3])
-    outward_y = world_y - float(depth_to_world_matrix[1, 3])
-    outward_z = world_z - float(depth_to_world_matrix[2, 3])
-    outward_norm = (outward_x * outward_x + outward_y * outward_y + outward_z * outward_z) ** 0.5
-    if outward_norm <= 0.0:
-        marker_center_world = [world_x, world_y, world_z]
-    else:
-        radius_scale = MARKER_SPHERE_RADIUS_METRES / outward_norm
-        marker_center_world = [
-            world_x + outward_x * radius_scale,
-            world_y + outward_y * radius_scale,
-            world_z + outward_z * radius_scale,
-        ]
-
-    return [float(marker_center_world[0]), float(marker_center_world[1]), float(marker_center_world[2])]
-
-
-def resolve_marker_world_coordinates(
-    depth: np.ndarray,
-    depth_to_world_matrix: np.ndarray | None,
-    unit_plane_map: np.ndarray | None,
-    marker_detections: list[MarkerDetection],
-    coordinate_average: RollingAverage | None = None,
-) -> tuple[list[list[float]], float]:
-    start_time = time.perf_counter()
-    if depth_to_world_matrix is None or unit_plane_map is None:
-        coordinates: list[list[float]] = []
-    else:
-        coordinates = [
-            coordinate
-            for coordinate in (
-                marker_pixel_to_world(depth, depth_to_world_matrix, unit_plane_map, marker_detection)
-                for marker_detection in marker_detections
-            )
-            if coordinate is not None
-        ]
-    elapsed_ms = (time.perf_counter() - start_time) * 1000.0
-    average_coordinate_ms = coordinate_average.add(elapsed_ms) if coordinate_average is not None else elapsed_ms
-    return coordinates, average_coordinate_ms
-
-
-def serialize_marker_world_coordinates(coordinates: list[list[float]]) -> bytes:
-    response = bytearray(COORD_RESPONSE_HEADER_STRUCT.size + len(coordinates) * COORD_RESPONSE_POINT_STRUCT.size)
-    COORD_RESPONSE_HEADER_STRUCT.pack_into(response, 0, COORD_RESPONSE_MAGIC, len(coordinates))
-    offset = COORD_RESPONSE_HEADER_STRUCT.size
-    for coordinate in coordinates:
-        COORD_RESPONSE_POINT_STRUCT.pack_into(
+    MARKER_PIXEL_RESPONSE_HEADER_STRUCT.pack_into(response, 0, MARKER_PIXEL_RESPONSE_MAGIC, len(marker_detections))
+    offset = MARKER_PIXEL_RESPONSE_HEADER_STRUCT.size
+    for marker_detection in marker_detections:
+        pixel_x, pixel_y = marker_detection.center_xy
+        MARKER_PIXEL_RESPONSE_POINT_STRUCT.pack_into(
             response,
             offset,
-            float(coordinate[0]),
-            float(coordinate[1]),
-            float(coordinate[2]),
+            float(pixel_x),
+            float(pixel_y),
         )
-        offset += COORD_RESPONSE_POINT_STRUCT.size
+        offset += MARKER_PIXEL_RESPONSE_POINT_STRUCT.size
     return bytes(response)
 
 
@@ -788,7 +767,7 @@ def render_frame(
     frame: SensorFrame,
     receive_fps: float,
     average_yolo_marker_ms: float,
-    average_coordinate_ms: float,
+    average_response_latency_ms: float,
 ) -> np.ndarray:
     depth_display = cv2.cvtColor(normalize_depth_for_display(frame.depth), cv2.COLOR_GRAY2BGR)
     infrared_display = cv2.cvtColor(normalize_min_max_for_display(frame.infrared), cv2.COLOR_GRAY2BGR)
@@ -801,7 +780,8 @@ def render_frame(
             "Depth 16-bit",
             f"Frame {frame.sequence}",
             f"RX FPS {receive_fps:.1f}",
-            f"Detect+Coord {average_yolo_marker_ms + average_coordinate_ms:.1f} ms",
+            f"Detect {average_yolo_marker_ms:.1f} ms",
+            f"Server latency {average_response_latency_ms:.1f} ms",
         ],
     )
     draw_text(
@@ -810,7 +790,7 @@ def render_frame(
             "Infrared 16-bit",
             f"Markers {len(frame.marker_detections)}",
             f"Detect {average_yolo_marker_ms:.1f} ms",
-            f"Coord {average_coordinate_ms:.1f} ms",
+            f"Server latency {average_response_latency_ms:.1f} ms",
             f"Received {received_text}",
             f"Client TS {frame.client_timestamp:.3f}",
         ],
@@ -840,7 +820,6 @@ def publish_sensor_frame(
     image_writer: AsyncRawImagePickleWriter | None = None,
     marker_detections: list[MarkerDetection] | None = None,
     average_yolo_marker_ms: float | None = None,
-    average_coordinate_ms: float | None = None,
 ) -> tuple[SensorFrame, float]:
     received_timestamp = time.time()
     receive_fps = fps_counter.tick(time.perf_counter())
@@ -860,8 +839,6 @@ def publish_sensor_frame(
         state.receive_fps = receive_fps
         if average_yolo_marker_ms is not None:
             state.average_yolo_marker_ms = average_yolo_marker_ms
-        if average_coordinate_ms is not None:
-            state.average_coordinate_ms = average_coordinate_ms
         state.last_error = ""
         state.lock.notify_all()
 
@@ -875,9 +852,8 @@ def process_message(
     message: bytes,
     state: SharedState,
     fps_counter: FpsCounter,
-    marker_tracker: IRMarkerTracker,
+    marker_tracker: IRMarkerTracker | ThresholdMarkerDetector,
     yolo_average: RollingAverage,
-    coordinate_average: RollingAverage,
     image_writer: AsyncRawImagePickleWriter | None = None,
     cached_unit_plane_map: np.ndarray | None = None,
 ) -> bytes:
@@ -891,13 +867,6 @@ def process_message(
     )
     marker_detections, yolo_marker_ms = detect_infrared_markers(infrared, marker_tracker)
     average_yolo_marker_ms = yolo_average.add(yolo_marker_ms)
-    marker_world_coordinates, average_coordinate_ms = resolve_marker_world_coordinates(
-        depth,
-        depth_to_world_matrix,
-        unit_plane_map,
-        marker_detections,
-        coordinate_average,
-    )
     frame, receive_fps = publish_sensor_frame(
         depth,
         infrared,
@@ -910,21 +879,23 @@ def process_message(
         image_writer=image_writer,
         marker_detections=marker_detections,
         average_yolo_marker_ms=average_yolo_marker_ms,
-        average_coordinate_ms=average_coordinate_ms,
     )
     received = datetime.fromtimestamp(frame.received_timestamp)
-    average_total_processing_ms = average_yolo_marker_ms + average_coordinate_ms
+    with state.lock:
+        last_response_latency_ms = state.last_response_latency_ms
+        average_response_latency_ms = state.average_response_latency_ms
     print(
         f"[{received:%Y-%m-%d %H:%M:%S.%f}] "
         f"frame={frame.sequence} client_ts={frame.client_timestamp:.6f} "
         f"rx_fps={receive_fps:.2f} markers={len(frame.marker_detections)} "
-        f"avg_detect_coord_ms={average_total_processing_ms:.2f} "
-        f"avg_detect_ms={average_yolo_marker_ms:.2f} avg_coord_ms={average_coordinate_ms:.2f} "
+        f"avg_detect_ms={average_yolo_marker_ms:.2f} "
+        f"last_server_latency_ms={last_response_latency_ms:.2f} "
+        f"avg_server_latency_ms={average_response_latency_ms:.2f} "
         f"depth_shape={frame.depth.shape} infrared_shape={frame.infrared.shape}",
         flush=True,
     )
 
-    return serialize_marker_world_coordinates(marker_world_coordinates)
+    return serialize_marker_pixels(marker_detections)
 
 
 class RawSensorImageReceiver:
@@ -937,6 +908,7 @@ class RawSensorImageReceiver:
         save_raw_images: bool = SAVE_RAW_IMAGES_TO_PICKLE,
         image_output_dir: Path | str = IR_DATA_DIR,
         detector: str = DETECTOR,
+        print_response_latency: bool = False,
     ) -> None:
         self.host = host
         self.port = port
@@ -945,13 +917,13 @@ class RawSensorImageReceiver:
         self.save_raw_images = save_raw_images
         self.image_output_dir = Path(image_output_dir)
         self.detector = detector
+        self.print_response_latency = print_response_latency
         self.state = SharedState()
         self.stop_event = threading.Event()
         self.server_thread: threading.Thread | None = None
         self.server: RawSensorTcpServer | None = None
         self.fps_counter = FpsCounter()
         self.yolo_average = RollingAverage()
-        self.coordinate_average = RollingAverage()
         self.cached_unit_plane_map: np.ndarray | None = None
         self.image_writer = AsyncRawImagePickleWriter(self.image_output_dir) if save_raw_images else None
         self.marker_tracker = create_marker_tracker(detector)
@@ -1054,7 +1026,6 @@ class RawSensorImageReceiver:
 
     def _reset_processing_averages(self) -> None:
         self.yolo_average.reset()
-        self.coordinate_average.reset()
         self.cached_unit_plane_map = None
 
     def _raw_sensor_worker(self, message: bytes) -> bytes:
@@ -1072,7 +1043,6 @@ class RawSensorImageReceiver:
                     self.fps_counter,
                     self.marker_tracker,
                     self.yolo_average,
-                    self.coordinate_average,
                     image_writer=self.image_writer,
                     cached_unit_plane_map=self.cached_unit_plane_map,
                 )
@@ -1093,13 +1063,6 @@ class RawSensorImageReceiver:
                 self.cached_unit_plane_map = unit_plane_map.copy()
             marker_detections, yolo_marker_ms = detect_infrared_markers(infrared, self.marker_tracker)
             average_yolo_marker_ms = self.yolo_average.add(yolo_marker_ms)
-            marker_world_coordinates, average_coordinate_ms = resolve_marker_world_coordinates(
-                depth,
-                depth_to_world_matrix,
-                unit_plane_map,
-                marker_detections,
-                self.coordinate_average,
-            )
             publish_sensor_frame(
                 depth,
                 infrared,
@@ -1112,10 +1075,9 @@ class RawSensorImageReceiver:
                 image_writer=self.image_writer,
                 marker_detections=marker_detections,
                 average_yolo_marker_ms=average_yolo_marker_ms,
-                average_coordinate_ms=average_coordinate_ms,
             )
 
-            return serialize_marker_world_coordinates(marker_world_coordinates)
+            return serialize_marker_pixels(marker_detections)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             with self.state.lock:
@@ -1133,6 +1095,7 @@ class RawSensorImageReceiver:
             client_timeout=self.client_timeout,
             state=self.state,
             on_disconnect=self._reset_processing_averages,
+            print_response_latency=self.print_response_latency,
         )
         self.server.set_debug_mode(False)
         print(f"Raw sensor server listening on {self.host}:{self.port}", flush=True)
@@ -1187,7 +1150,7 @@ def visualization_loop(state: SharedState, stop_event: threading.Event) -> None:
             frame = state.latest_frame
             receive_fps = state.receive_fps
             average_yolo_marker_ms = state.average_yolo_marker_ms
-            average_coordinate_ms = state.average_coordinate_ms
+            average_response_latency_ms = state.average_response_latency_ms
             last_error = state.last_error
             active_tcp_connections = state.active_tcp_connections
 
@@ -1203,7 +1166,7 @@ def visualization_loop(state: SharedState, stop_event: threading.Event) -> None:
                 waiting_message = "TCP connected"
             display = render_waiting_frame(waiting_title, waiting_message)
         else:
-            display = render_frame(frame, receive_fps, average_yolo_marker_ms, average_coordinate_ms)
+            display = render_frame(frame, receive_fps, average_yolo_marker_ms, average_response_latency_ms)
             if last_error:
                 draw_text(display, [last_error])
 
@@ -1227,6 +1190,7 @@ def start_receiver(
     save_raw_images: bool = SAVE_RAW_IMAGES_TO_PICKLE,
     image_output_dir: Path | str = IR_DATA_DIR,
     detector: str = DETECTOR,
+    print_response_latency: bool = False,
 ) -> RawSensorImageReceiver:
     global _default_receiver
 
@@ -1237,6 +1201,7 @@ def start_receiver(
         save_raw_images=save_raw_images,
         image_output_dir=image_output_dir,
         detector=detector,
+        print_response_latency=print_response_latency,
     )
     receiver.start()
     _default_receiver = receiver
@@ -1312,10 +1277,18 @@ def parse_args() -> argparse.Namespace:
         help="Print one receive/debug log line for every raw sensor frame.",
     )
     parser.add_argument(
+        "--print-response-latency",
+        action="store_true",
+        help=(
+            "Print one latency line after each response is sent. "
+            "Measures from complete request receipt to successful socket send."
+        ),
+    )
+    parser.add_argument(
         "--detector",
-        choices=("blob", "yolo"),
+        choices=("threshold", "blob", "yolo"),
         default=DETECTOR,
-        help=f"Marker detector to use. Default: {DETECTOR}",
+        help=f"Marker detector to use. 'blob' is accepted as an alias for 'threshold'. Default: {DETECTOR}",
     )
     return parser.parse_args()
 
@@ -1329,6 +1302,7 @@ def main() -> None:
         save_raw_images=args.save_raw_images,
         image_output_dir=args.image_output_dir,
         detector=args.detector,
+        print_response_latency=args.print_response_latency,
     )
 
     def request_shutdown(signum: int, frame: object) -> None:

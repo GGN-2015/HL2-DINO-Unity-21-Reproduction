@@ -65,14 +65,15 @@ public class ResearchModeController : MonoBehaviour
     private const int SensorImagePixelCount = SensorImageWidth * SensorImageHeight;
     private const int SensorTcpHeaderV4BaseBytes = 48;
     private const int SensorTcpDepthToWorldMatrixValues = 16;
-    private const int SensorTcpUnitPlaneValuesPerPixel = 2;
     private const float Raw16MaxValue = 65535f;
     private const float DepthDisplayBlackMm = 1f;
     private const float DepthDisplayWhiteMm = 4090f;
+    private const float DepthMaxMm = 4090f;
+    private const float MarkerSphereRadiusMetres = 0.005f;
     private const float SensorImageUploadIntervalSeconds = 1f / 30f;
     private static readonly byte[] SensorTcpRawStreamPrefix = Encoding.ASCII.GetBytes("raw_stream:");
     private static readonly byte[] SensorTcpPayloadMagic = Encoding.ASCII.GetBytes("DINOIMG4");
-    private static readonly byte[] MarkerWorldResponseMagic = Encoding.ASCII.GetBytes("DINOXYZ1");
+    private static readonly byte[] MarkerPixelResponseMagic = Encoding.ASCII.GetBytes("DINOUV01");
     private const float MarkerSphereDiameterMetres = 0.01f;
 
     private static readonly int SourceChannelId = Shader.PropertyToID("_SourceChannel");
@@ -91,17 +92,15 @@ public class ResearchModeController : MonoBehaviour
     private Thread sensorTcpThread = null;
     private SimpleTcpClient sensorTcpClient = null;
     private byte[] sensorTcpPayloadBuffer = null;
-    private float[] sensorTcpUnitPlaneBuffer = null;
-    private bool sensorTcpUnitPlaneBufferReady = false;
-    private bool sensorTcpUnitPlaneMapSent = false;
     private RawSensorTcpFrame latestSensorTcpFrame = null;
     private readonly object sensorTcpFrameLock = new object();
     private readonly object sensorTcpStatusLock = new object();
     private string sensorTcpStatusMessage = string.Empty;
     private bool sensorTcpStatusDirty = false;
-    private readonly object markerWorldPositionsLock = new object();
-    private List<Vector3> latestMarkerWorldPositions = new List<Vector3>();
-    private bool newMarkerWorldPositionsReceived = false;
+    private readonly object markerPixelsLock = new object();
+    private RawSensorTcpFrame latestMarkerPixelFrame = null;
+    private List<Vector2> latestMarkerPixels = new List<Vector2>();
+    private bool newMarkerPixelsReceived = false;
     private readonly List<GameObject> markerWorldSpheres = new List<GameObject>();
     private Material markerSphereMaterial = null;
 
@@ -281,8 +280,6 @@ public class ResearchModeController : MonoBehaviour
         sensorTcpThread = null;
         latestSensorTcpFrame = null;
         sensorTcpPayloadBuffer = null;
-        sensorTcpUnitPlaneBufferReady = false;
-        sensorTcpUnitPlaneMapSent = false;
     }
 
     private void SetSensorTcpStatus(string message)
@@ -320,7 +317,6 @@ public class ResearchModeController : MonoBehaviour
         if (depthFrame == null || infraredFrame == null) return;
         if (depthFrame.Length < SensorImagePixelCount || infraredFrame.Length < SensorImagePixelCount) return;
         if (depthToWorldMatrix == null || depthToWorldMatrix.Length < SensorTcpDepthToWorldMatrixValues) return;
-        if (!EnsureSensorTcpUnitPlaneBuffer()) return;
         if (Time.unscaledTime < nextSensorTcpQueueTime) return;
 
         float frameInterval = Mathf.Clamp(sensorTcpFrameIntervalSeconds, 0f, SensorImageUploadIntervalSeconds);
@@ -328,14 +324,16 @@ public class ResearchModeController : MonoBehaviour
 
         double[] matrixCopy = new double[SensorTcpDepthToWorldMatrixValues];
         Array.Copy(depthToWorldMatrix, matrixCopy, SensorTcpDepthToWorldMatrixValues);
+        ushort[] depthCopy = new ushort[SensorImagePixelCount];
+        ushort[] infraredCopy = new ushort[SensorImagePixelCount];
+        Array.Copy(depthFrame, depthCopy, SensorImagePixelCount);
+        Array.Copy(infraredFrame, infraredCopy, SensorImagePixelCount);
 
         RawSensorTcpFrame frame = new RawSensorTcpFrame
         {
-            Depth = depthFrame,
-            Infrared = infraredFrame,
+            Depth = depthCopy,
+            Infrared = infraredCopy,
             DepthToWorldMatrix = matrixCopy,
-            UnitPlaneMap = sensorTcpUnitPlaneBuffer,
-            IncludeUnitPlaneMap = !sensorTcpUnitPlaneMapSent,
             Sequence = ++sensorTcpFrameSequence,
             TimestampUnixSeconds = GetUnixTimeSeconds()
         };
@@ -366,39 +364,6 @@ public class ResearchModeController : MonoBehaviour
             latestSensorTcpFrame = null;
             return frame;
         }
-    }
-
-    private bool EnsureSensorTcpUnitPlaneBuffer()
-    {
-        if (sensorTcpUnitPlaneBufferReady && sensorTcpUnitPlaneBuffer != null) return true;
-
-#if ENABLE_WINMD_SUPPORT
-        if (researchMode == null) return false;
-
-        int valueCount = SensorImagePixelCount * SensorTcpUnitPlaneValuesPerPixel;
-        if (sensorTcpUnitPlaneBuffer == null || sensorTcpUnitPlaneBuffer.Length != valueCount)
-        {
-            sensorTcpUnitPlaneBuffer = new float[valueCount];
-        }
-
-        int offset = 0;
-        for (int y = 0; y < SensorImageHeight; ++y)
-        {
-            for (int x = 0; x < SensorImageWidth; ++x)
-            {
-                float[] unitPlane = researchMode.MapImagePointToCameraUnitPlane((float)x, (float)y);
-                if (unitPlane == null || unitPlane.Length < SensorTcpUnitPlaneValuesPerPixel) return false;
-
-                sensorTcpUnitPlaneBuffer[offset++] = unitPlane[0];
-                sensorTcpUnitPlaneBuffer[offset++] = unitPlane[1];
-            }
-        }
-
-        sensorTcpUnitPlaneBufferReady = true;
-        return true;
-#else
-        return false;
-#endif
     }
 
     private void SensorTcpBackgroundLoop()
@@ -435,13 +400,13 @@ public class ResearchModeController : MonoBehaviour
 
             try
             {
-                List<Vector3> markerWorldPositions = ParseServerMarkerWorldResponse(response);
-                lock (markerWorldPositionsLock)
+                List<Vector2> markerPixels = ParseServerMarkerPixelResponse(response);
+                lock (markerPixelsLock)
                 {
-                    latestMarkerWorldPositions = markerWorldPositions;
-                    newMarkerWorldPositionsReceived = true;
+                    latestMarkerPixelFrame = frame;
+                    latestMarkerPixels = markerPixels;
+                    newMarkerPixelsReceived = true;
                 }
-                sensorTcpUnitPlaneMapSent = true;
             }
             catch (Exception ex)
             {
@@ -497,7 +462,6 @@ public class ResearchModeController : MonoBehaviour
         try { sensorTcpClient?.Dispose(); }
         catch { }
         sensorTcpClient = null;
-        sensorTcpUnitPlaneMapSent = false;
     }
 
     private static string GetSensorTcpErrorReason(SimpleTcpClient client)
@@ -527,34 +491,34 @@ public class ResearchModeController : MonoBehaviour
         }
     }
 
-    private static List<Vector3> ParseServerMarkerWorldResponse(byte[] response)
+    private static List<Vector2> ParseServerMarkerPixelResponse(byte[] response)
     {
-        if (IsBinaryMarkerWorldResponse(response))
+        if (IsBinaryMarkerPixelResponse(response))
         {
-            return ParseBinaryMarkerWorldResponse(response);
+            return ParseBinaryMarkerPixelResponse(response);
         }
 
-        return ParseJsonMarkerWorldResponse(response);
+        return ParseJsonMarkerPixelResponse(response);
     }
 
-    private static bool IsBinaryMarkerWorldResponse(byte[] response)
+    private static bool IsBinaryMarkerPixelResponse(byte[] response)
     {
-        if (response == null || response.Length < MarkerWorldResponseMagic.Length) return false;
-        for (int i = 0; i < MarkerWorldResponseMagic.Length; ++i)
+        if (response == null || response.Length < MarkerPixelResponseMagic.Length) return false;
+        for (int i = 0; i < MarkerPixelResponseMagic.Length; ++i)
         {
-            if (response[i] != MarkerWorldResponseMagic[i]) return false;
+            if (response[i] != MarkerPixelResponseMagic[i]) return false;
         }
 
         return true;
     }
 
-    private static List<Vector3> ParseBinaryMarkerWorldResponse(byte[] response)
+    private static List<Vector2> ParseBinaryMarkerPixelResponse(byte[] response)
     {
         const int headerBytes = 12;
-        const int pointBytes = 12;
+        const int pointBytes = 8;
         if (response.Length < headerBytes) throw new ArgumentException("Marker response is too short.");
 
-        int offset = MarkerWorldResponseMagic.Length;
+        int offset = MarkerPixelResponseMagic.Length;
         uint count = ReadUInt32LittleEndian(response, ref offset);
         int expectedLength = headerBytes + checked((int)count * pointBytes);
         if (response.Length != expectedLength)
@@ -562,35 +526,33 @@ public class ResearchModeController : MonoBehaviour
             throw new ArgumentException($"Marker response size mismatch: got {response.Length}, expected {expectedLength}.");
         }
 
-        List<Vector3> markerWorldPositions = new List<Vector3>((int)count);
+        List<Vector2> markerPixels = new List<Vector2>((int)count);
         for (int i = 0; i < count; ++i)
         {
-            float x = ReadFloatLittleEndian(response, ref offset);
-            float y = ReadFloatLittleEndian(response, ref offset);
-            float z = ReadFloatLittleEndian(response, ref offset);
-            markerWorldPositions.Add(new Vector3(x, y, -z));
+            float pixelX = ReadFloatLittleEndian(response, ref offset);
+            float pixelY = ReadFloatLittleEndian(response, ref offset);
+            markerPixels.Add(new Vector2(pixelX, pixelY));
         }
 
-        return markerWorldPositions;
+        return markerPixels;
     }
 
-    private static List<Vector3> ParseJsonMarkerWorldResponse(byte[] response)
+    private static List<Vector2> ParseJsonMarkerPixelResponse(byte[] response)
     {
         string json = Encoding.UTF8.GetString(response);
         JArray markerArray = JArray.Parse(json);
-        List<Vector3> markerWorldPositions = new List<Vector3>();
+        List<Vector2> markerPixels = new List<Vector2>();
 
         foreach (var markerToken in markerArray)
         {
-            if (!(markerToken is JArray marker) || marker.Count < 3) continue;
+            if (!(markerToken is JArray marker) || marker.Count < 2) continue;
 
-            markerWorldPositions.Add(new Vector3(
+            markerPixels.Add(new Vector2(
                 marker[0].ToObject<float>(),
-                marker[1].ToObject<float>(),
-                -marker[2].ToObject<float>()));
+                marker[1].ToObject<float>()));
         }
 
-        return markerWorldPositions;
+        return markerPixels;
     }
 
     private static byte[] BuildRawSensorTcpPayload(RawSensorTcpFrame frame, ref byte[] payload)
@@ -598,9 +560,7 @@ public class ResearchModeController : MonoBehaviour
         int depthByteLength = SensorImagePixelCount * sizeof(ushort);
         int infraredByteLength = SensorImagePixelCount * sizeof(ushort);
         int matrixByteLength = SensorTcpDepthToWorldMatrixValues * sizeof(double);
-        int unitPlaneCount = frame.IncludeUnitPlaneMap ? SensorImagePixelCount : 0;
-        int unitPlaneByteLength = unitPlaneCount * SensorTcpUnitPlaneValuesPerPixel * sizeof(float);
-        int payloadLength = SensorTcpRawStreamPrefix.Length + SensorTcpHeaderV4BaseBytes + matrixByteLength + unitPlaneByteLength + depthByteLength + infraredByteLength;
+        int payloadLength = SensorTcpRawStreamPrefix.Length + SensorTcpHeaderV4BaseBytes + matrixByteLength + depthByteLength + infraredByteLength;
         if (payload == null || payload.Length != payloadLength)
         {
             payload = new byte[payloadLength];
@@ -617,7 +577,7 @@ public class ResearchModeController : MonoBehaviour
         WriteInt32(payload, ref offset, SensorImagePixelCount);
         WriteInt32(payload, ref offset, SensorImagePixelCount);
         WriteInt32(payload, ref offset, SensorTcpDepthToWorldMatrixValues);
-        WriteInt32(payload, ref offset, unitPlaneCount);
+        WriteInt32(payload, ref offset, 0);
 
         if (BitConverter.IsLittleEndian)
         {
@@ -629,22 +589,6 @@ public class ResearchModeController : MonoBehaviour
             foreach (double matrixValue in frame.DepthToWorldMatrix)
             {
                 WriteDouble(payload, ref offset, matrixValue);
-            }
-        }
-
-        if (frame.IncludeUnitPlaneMap)
-        {
-            if (BitConverter.IsLittleEndian)
-            {
-                Buffer.BlockCopy(frame.UnitPlaneMap, 0, payload, offset, unitPlaneByteLength);
-                offset += unitPlaneByteLength;
-            }
-            else
-            {
-                foreach (float unitPlaneValue in frame.UnitPlaneMap)
-                {
-                    WriteFloat(payload, ref offset, unitPlaneValue);
-                }
             }
         }
 
@@ -689,25 +633,6 @@ public class ResearchModeController : MonoBehaviour
         WriteUInt64(target, ref offset, (ulong)BitConverter.DoubleToInt64Bits(value));
     }
 
-    private static void WriteFloat(byte[] target, ref int offset, float value)
-    {
-        byte[] valueBytes = BitConverter.GetBytes(value);
-        if (BitConverter.IsLittleEndian)
-        {
-            target[offset++] = valueBytes[0];
-            target[offset++] = valueBytes[1];
-            target[offset++] = valueBytes[2];
-            target[offset++] = valueBytes[3];
-        }
-        else
-        {
-            target[offset++] = valueBytes[3];
-            target[offset++] = valueBytes[2];
-            target[offset++] = valueBytes[1];
-            target[offset++] = valueBytes[0];
-        }
-    }
-
     private static uint ReadUInt32LittleEndian(byte[] source, ref int offset)
     {
         uint value = (uint)(
@@ -745,18 +670,102 @@ public class ResearchModeController : MonoBehaviour
         return (DateTime.UtcNow - unixEpoch).TotalSeconds;
     }
 
-    private void ApplyLatestMarkerWorldPositions()
+    private void ApplyLatestMarkerPixels()
     {
-        List<Vector3> markerWorldPositions = null;
-        lock (markerWorldPositionsLock)
+        RawSensorTcpFrame markerFrame = null;
+        List<Vector2> markerPixels = null;
+        lock (markerPixelsLock)
         {
-            if (!newMarkerWorldPositionsReceived) return;
+            if (!newMarkerPixelsReceived) return;
 
-            markerWorldPositions = new List<Vector3>(latestMarkerWorldPositions);
-            newMarkerWorldPositionsReceived = false;
+            markerFrame = latestMarkerPixelFrame;
+            markerPixels = new List<Vector2>(latestMarkerPixels);
+            newMarkerPixelsReceived = false;
         }
 
+        List<Vector3> markerWorldPositions = ResolveMarkerWorldPositions(markerFrame, markerPixels);
         ReplaceMarkerWorldSpheres(markerWorldPositions);
+    }
+
+    private List<Vector3> ResolveMarkerWorldPositions(RawSensorTcpFrame frame, List<Vector2> markerPixels)
+    {
+        List<Vector3> markerWorldPositions = new List<Vector3>();
+        if (frame == null || markerPixels == null || frame.Depth == null || frame.DepthToWorldMatrix == null) return markerWorldPositions;
+
+#if ENABLE_WINMD_SUPPORT
+        foreach (Vector2 markerPixel in markerPixels)
+        {
+            Vector3? markerWorldPosition = ResolveMarkerWorldPosition(frame, markerPixel);
+            if (markerWorldPosition.HasValue)
+            {
+                markerWorldPositions.Add(markerWorldPosition.Value);
+            }
+        }
+#endif
+
+        return markerWorldPositions;
+    }
+
+#if ENABLE_WINMD_SUPPORT
+    private Vector3? ResolveMarkerWorldPosition(RawSensorTcpFrame frame, Vector2 markerPixel)
+    {
+        float depthValue = BilinearDepthAt(frame.Depth, markerPixel.x, markerPixel.y);
+        if (depthValue <= 0f || depthValue > DepthMaxMm) return null;
+
+        float[] unitPlane = researchMode.MapImagePointToCameraUnitPlane(markerPixel.x, markerPixel.y);
+        if (unitPlane == null || unitPlane.Length < 2) return null;
+
+        double unitPlaneX = unitPlane[0];
+        double unitPlaneY = unitPlane[1];
+        double rayNorm = Math.Sqrt(unitPlaneX * unitPlaneX + unitPlaneY * unitPlaneY + 1.0);
+        if (rayNorm <= 0.0) return null;
+
+        double depthMetres = depthValue / 1000.0;
+        double pointX = unitPlaneX * depthMetres / rayNorm;
+        double pointY = unitPlaneY * depthMetres / rayNorm;
+        double pointZ = depthMetres / rayNorm;
+        double[] matrix = frame.DepthToWorldMatrix;
+
+        double worldX = matrix[0] * pointX + matrix[4] * pointY + matrix[8] * pointZ + matrix[12];
+        double worldY = matrix[1] * pointX + matrix[5] * pointY + matrix[9] * pointZ + matrix[13];
+        double worldZ = matrix[2] * pointX + matrix[6] * pointY + matrix[10] * pointZ + matrix[14];
+
+        double outwardX = worldX - matrix[12];
+        double outwardY = worldY - matrix[13];
+        double outwardZ = worldZ - matrix[14];
+        double outwardNorm = Math.Sqrt(outwardX * outwardX + outwardY * outwardY + outwardZ * outwardZ);
+        if (outwardNorm > 0.0)
+        {
+            double radiusScale = MarkerSphereRadiusMetres / outwardNorm;
+            worldX += outwardX * radiusScale;
+            worldY += outwardY * radiusScale;
+            worldZ += outwardZ * radiusScale;
+        }
+
+        return new Vector3((float)worldX, (float)worldY, -(float)worldZ);
+    }
+#endif
+
+    private static float BilinearDepthAt(ushort[] depth, float pixelX, float pixelY)
+    {
+        float x = Mathf.Clamp(pixelX, 0f, SensorImageWidth - 1f);
+        float y = Mathf.Clamp(pixelY, 0f, SensorImageHeight - 1f);
+        int x0 = Mathf.FloorToInt(x);
+        int y0 = Mathf.FloorToInt(y);
+        int x1 = Math.Min(x0 + 1, SensorImageWidth - 1);
+        int y1 = Math.Min(y0 + 1, SensorImageHeight - 1);
+        float wx = x - x0;
+        float wy = y - y0;
+
+        float d00 = depth[y0 * SensorImageWidth + x0];
+        float d10 = depth[y0 * SensorImageWidth + x1];
+        float d01 = depth[y1 * SensorImageWidth + x0];
+        float d11 = depth[y1 * SensorImageWidth + x1];
+
+        return d00 * (1f - wx) * (1f - wy)
+            + d10 * wx * (1f - wy)
+            + d01 * (1f - wx) * wy
+            + d11 * wx * wy;
     }
 
     private void ReplaceMarkerWorldSpheres(List<Vector3> markerWorldPositions)
@@ -865,7 +874,7 @@ public class ResearchModeController : MonoBehaviour
         GrabLatestSensorImages();
         GrabLatestToolDictionary();
 #endif
-        ApplyLatestMarkerWorldPositions();
+        ApplyLatestMarkerPixels();
         ApplySensorTcpStatusToScreen();
     }
 
@@ -984,8 +993,6 @@ public class ResearchModeController : MonoBehaviour
         public ushort[] Depth;
         public ushort[] Infrared;
         public double[] DepthToWorldMatrix;
-        public float[] UnitPlaneMap;
-        public bool IncludeUnitPlaneMap;
         public ulong Sequence;
         public double TimestampUnixSeconds;
     }
