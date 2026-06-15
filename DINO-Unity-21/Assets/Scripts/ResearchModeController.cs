@@ -5,7 +5,6 @@ using System.Text;
 using System.Threading;
 using System.Collections.Generic;
 using UnityEngine.XR.WSA;
-using Newtonsoft.Json.Linq;
 
 #if !UNITY_EDITOR && UNITY_WSA
 using Windows.Perception.Spatial;
@@ -60,6 +59,23 @@ public class ResearchModeController : MonoBehaviour
     public float sensorTcpFrameIntervalSeconds = 1f / 30f;
     public float sensorTcpReconnectIntervalSeconds = 1.0f;
 
+    [Header("Local Marker Detection")]
+    public bool detectMarkersInUnity = true;
+    public float localMarkerDetectionIntervalSeconds = 1f / 30f;
+    public float localThresholdConfidenceThreshold = ThresholdMarkerDetector.DefaultConfidenceThreshold;
+    public float localThresholdPercentile = ThresholdMarkerDetector.DefaultThresholdPercentile;
+    public int localThresholdMinimumThreshold = ThresholdMarkerDetector.DefaultMinimumThreshold;
+    public int localThresholdMinArea = ThresholdMarkerDetector.DefaultMinArea;
+    public int localThresholdMaxArea = ThresholdMarkerDetector.DefaultMaxArea;
+    public float localThresholdMinCircularity = ThresholdMarkerDetector.DefaultMinCircularity;
+    public float localThresholdMinAspectRatio = ThresholdMarkerDetector.DefaultMinAspectRatio;
+    public float localThresholdMaxAspectRatio = ThresholdMarkerDetector.DefaultMaxAspectRatio;
+    public int localThresholdMinWidth = ThresholdMarkerDetector.DefaultMinWidth;
+    public int localThresholdMinHeight = ThresholdMarkerDetector.DefaultMinHeight;
+    public int localThresholdMorphologyKernelSize = ThresholdMarkerDetector.DefaultMorphologyKernelSize;
+    public int localThresholdMorphologyOpenIterations = ThresholdMarkerDetector.DefaultMorphologyOpenIterations;
+    public int localThresholdMaxMarkers = ThresholdMarkerDetector.DefaultMaxDetections;
+
     private const int SensorImageWidth = 512;
     private const int SensorImageHeight = 512;
     private const int SensorImagePixelCount = SensorImageWidth * SensorImageHeight;
@@ -73,7 +89,6 @@ public class ResearchModeController : MonoBehaviour
     private const float SensorImageUploadIntervalSeconds = 1f / 30f;
     private static readonly byte[] SensorTcpRawStreamPrefix = Encoding.ASCII.GetBytes("raw_stream:");
     private static readonly byte[] SensorTcpPayloadMagic = Encoding.ASCII.GetBytes("DINOIMG4");
-    private static readonly byte[] MarkerPixelResponseMagic = Encoding.ASCII.GetBytes("DINOUV01");
     private const float MarkerSphereDiameterMetres = 0.01f;
 
     private static readonly int SourceChannelId = Shader.PropertyToID("_SourceChannel");
@@ -89,18 +104,25 @@ public class ResearchModeController : MonoBehaviour
     private float nextSensorTcpQueueTime = 0f;
     private ulong sensorTcpFrameSequence = 0;
     private volatile bool sensorTcpRunning = false;
+    private volatile bool sensorTcpConnected = false;
     private Thread sensorTcpThread = null;
     private SimpleTcpClient sensorTcpClient = null;
     private byte[] sensorTcpPayloadBuffer = null;
-    private RawSensorTcpFrame latestSensorTcpFrame = null;
+    private RawSensorFrame latestSensorTcpFrame = null;
     private readonly object sensorTcpFrameLock = new object();
     private readonly object sensorTcpStatusLock = new object();
     private string sensorTcpStatusMessage = string.Empty;
     private bool sensorTcpStatusDirty = false;
     private readonly object markerPixelsLock = new object();
-    private RawSensorTcpFrame latestMarkerPixelFrame = null;
+    private RawSensorFrame latestMarkerPixelFrame = null;
     private List<Vector2> latestMarkerPixels = new List<Vector2>();
     private bool newMarkerPixelsReceived = false;
+    private readonly object localMarkerFrameLock = new object();
+    private RawSensorFrame latestLocalMarkerFrame = null;
+    private volatile bool localMarkerDetectionRunning = false;
+    private Thread localMarkerDetectionThread = null;
+    private ThresholdMarkerDetector localMarkerDetector = null;
+    private float nextLocalMarkerDetectionQueueTime = 0f;
     private readonly List<GameObject> markerWorldSpheres = new List<GameObject>();
     private Material markerSphereMaterial = null;
 
@@ -117,6 +139,9 @@ public class ResearchModeController : MonoBehaviour
     /// </summary>
     public UnityToolManager ToolManagerScript;
 
+    [Header("AimTool Model Tracking")]
+    public AimToolModelTracker AimToolTrackerScript;
+
     public string JSONFilename = "toolConfig.json";
     string JSONStorageFolder = "";
 
@@ -125,7 +150,9 @@ public class ResearchModeController : MonoBehaviour
     {
         // (1) Caching/attaching Unity objects
         ImageTexturesSetup();
+        StartLocalMarkerDetectionThread();
         StartSensorTcpThread();
+        EnsureAimToolModelTracker();
 
         // (2) Reading tool config data from file
         string toolConfigJSONString = ToolConfigJSONSetup();
@@ -247,6 +274,120 @@ public class ResearchModeController : MonoBehaviour
         ConfigureRaw16GrayscaleMaterial(abImageMediaMaterial, minValue, maxValue, maxValue, 0f, false);
     }
 
+    private void StartLocalMarkerDetectionThread()
+    {
+        if (!detectMarkersInUnity || localMarkerDetectionThread != null) return;
+
+        localMarkerDetectionRunning = true;
+        localMarkerDetectionThread = new Thread(LocalMarkerDetectionBackgroundLoop)
+        {
+            IsBackground = true,
+            Name = "DINO Local Threshold Marker Detector"
+        };
+        localMarkerDetectionThread.Start();
+    }
+
+    private void StopLocalMarkerDetectionThread()
+    {
+        localMarkerDetectionRunning = false;
+
+        lock (localMarkerFrameLock)
+        {
+            Monitor.PulseAll(localMarkerFrameLock);
+        }
+
+        if (localMarkerDetectionThread != null && localMarkerDetectionThread.IsAlive)
+        {
+            localMarkerDetectionThread.Join(1000);
+        }
+
+        localMarkerDetectionThread = null;
+        latestLocalMarkerFrame = null;
+    }
+
+    private void QueueRawSensorFrameForLocalMarkerDetection(RawSensorFrame frame)
+    {
+        if (!detectMarkersInUnity || !localMarkerDetectionRunning) return;
+        if (frame == null || frame.Depth == null || frame.Infrared == null || frame.DepthToWorldMatrix == null) return;
+        if (Time.unscaledTime < nextLocalMarkerDetectionQueueTime) return;
+
+        float frameInterval = Math.Max(0f, localMarkerDetectionIntervalSeconds);
+        nextLocalMarkerDetectionQueueTime = Time.unscaledTime + frameInterval;
+
+        lock (localMarkerFrameLock)
+        {
+            latestLocalMarkerFrame = frame;
+            Monitor.Pulse(localMarkerFrameLock);
+        }
+    }
+
+    private RawSensorFrame WaitForLatestLocalMarkerFrame()
+    {
+        lock (localMarkerFrameLock)
+        {
+            while (localMarkerDetectionRunning && latestLocalMarkerFrame == null)
+            {
+                Monitor.Wait(localMarkerFrameLock, 250);
+            }
+
+            if (!localMarkerDetectionRunning) return null;
+
+            RawSensorFrame frame = latestLocalMarkerFrame;
+            latestLocalMarkerFrame = null;
+            return frame;
+        }
+    }
+
+    private void LocalMarkerDetectionBackgroundLoop()
+    {
+        try
+        {
+            localMarkerDetector = new ThresholdMarkerDetector(
+                SensorImageWidth,
+                SensorImageHeight,
+                confidenceThreshold: localThresholdConfidenceThreshold,
+                thresholdPercentile: localThresholdPercentile,
+                minimumThreshold: localThresholdMinimumThreshold,
+                minArea: localThresholdMinArea,
+                maxArea: localThresholdMaxArea,
+                minCircularity: localThresholdMinCircularity,
+                minAspectRatio: localThresholdMinAspectRatio,
+                maxAspectRatio: localThresholdMaxAspectRatio,
+                minWidth: localThresholdMinWidth,
+                minHeight: localThresholdMinHeight,
+                morphologyKernelSize: localThresholdMorphologyKernelSize,
+                morphologyOpenIterations: localThresholdMorphologyOpenIterations,
+                maxDetections: localThresholdMaxMarkers);
+        }
+        catch (Exception ex)
+        {
+            SetSensorTcpStatus($"Local marker detector disabled: {ex.Message}");
+            localMarkerDetectionRunning = false;
+            return;
+        }
+
+        while (localMarkerDetectionRunning)
+        {
+            RawSensorFrame frame = WaitForLatestLocalMarkerFrame();
+            if (frame == null) continue;
+
+            try
+            {
+                List<Vector2> markerPixels = localMarkerDetector.DetectCenters(frame.Infrared);
+                lock (markerPixelsLock)
+                {
+                    latestMarkerPixelFrame = frame;
+                    latestMarkerPixels = markerPixels;
+                    newMarkerPixelsReceived = true;
+                }
+            }
+            catch (Exception ex)
+            {
+                SetSensorTcpStatus($"Local marker detection failed: {ex.Message}");
+            }
+        }
+    }
+
     private void StartSensorTcpThread()
     {
         if (!streamRawSensorImagesOverTcp || sensorTcpThread != null) return;
@@ -271,6 +412,7 @@ public class ResearchModeController : MonoBehaviour
 
         try { sensorTcpClient?.Close(); }
         catch { }
+        sensorTcpConnected = false;
 
         if (sensorTcpThread != null && sensorTcpThread.IsAlive)
         {
@@ -311,16 +453,11 @@ public class ResearchModeController : MonoBehaviour
         }
     }
 
-    private void QueueRawSensorFrameForTcp(ushort[] depthFrame, ushort[] infraredFrame, double[] depthToWorldMatrix)
+    private RawSensorFrame CreateRawSensorFrameSnapshot(ushort[] depthFrame, ushort[] infraredFrame, double[] depthToWorldMatrix)
     {
-        if (!streamRawSensorImagesOverTcp || !sensorTcpRunning) return;
-        if (depthFrame == null || infraredFrame == null) return;
-        if (depthFrame.Length < SensorImagePixelCount || infraredFrame.Length < SensorImagePixelCount) return;
-        if (depthToWorldMatrix == null || depthToWorldMatrix.Length < SensorTcpDepthToWorldMatrixValues) return;
-        if (Time.unscaledTime < nextSensorTcpQueueTime) return;
-
-        float frameInterval = Mathf.Clamp(sensorTcpFrameIntervalSeconds, 0f, SensorImageUploadIntervalSeconds);
-        nextSensorTcpQueueTime = Time.unscaledTime + frameInterval;
+        if (depthFrame == null || infraredFrame == null) return null;
+        if (depthFrame.Length < SensorImagePixelCount || infraredFrame.Length < SensorImagePixelCount) return null;
+        if (depthToWorldMatrix == null || depthToWorldMatrix.Length < SensorTcpDepthToWorldMatrixValues) return null;
 
         double[] matrixCopy = new double[SensorTcpDepthToWorldMatrixValues];
         Array.Copy(depthToWorldMatrix, matrixCopy, SensorTcpDepthToWorldMatrixValues);
@@ -329,7 +466,7 @@ public class ResearchModeController : MonoBehaviour
         Array.Copy(depthFrame, depthCopy, SensorImagePixelCount);
         Array.Copy(infraredFrame, infraredCopy, SensorImagePixelCount);
 
-        RawSensorTcpFrame frame = new RawSensorTcpFrame
+        return new RawSensorFrame
         {
             Depth = depthCopy,
             Infrared = infraredCopy,
@@ -337,6 +474,31 @@ public class ResearchModeController : MonoBehaviour
             Sequence = ++sensorTcpFrameSequence,
             TimestampUnixSeconds = GetUnixTimeSeconds()
         };
+    }
+
+    private bool ShouldQueueLocalMarkerDetectionFrame()
+    {
+        return detectMarkersInUnity
+            && localMarkerDetectionRunning
+            && Time.unscaledTime >= nextLocalMarkerDetectionQueueTime;
+    }
+
+    private bool ShouldQueueSensorTcpFrame()
+    {
+        return streamRawSensorImagesOverTcp
+            && sensorTcpRunning
+            && sensorTcpConnected
+            && Time.unscaledTime >= nextSensorTcpQueueTime;
+    }
+
+    private void QueueRawSensorFrameForTcp(RawSensorFrame frame)
+    {
+        if (!streamRawSensorImagesOverTcp || !sensorTcpRunning) return;
+        if (frame == null || frame.Depth == null || frame.Infrared == null || frame.DepthToWorldMatrix == null) return;
+        if (Time.unscaledTime < nextSensorTcpQueueTime) return;
+
+        float frameInterval = Math.Max(0f, sensorTcpFrameIntervalSeconds);
+        nextSensorTcpQueueTime = Time.unscaledTime + frameInterval;
 
         lock (sensorTcpFrameLock)
         {
@@ -345,7 +507,7 @@ public class ResearchModeController : MonoBehaviour
         }
     }
 
-    private RawSensorTcpFrame WaitForLatestSensorTcpFrame()
+    private RawSensorFrame WaitForLatestSensorTcpFrame()
     {
         lock (sensorTcpFrameLock)
         {
@@ -360,7 +522,7 @@ public class ResearchModeController : MonoBehaviour
 
             if (!sensorTcpRunning) return null;
 
-            RawSensorTcpFrame frame = latestSensorTcpFrame;
+            RawSensorFrame frame = latestSensorTcpFrame;
             latestSensorTcpFrame = null;
             return frame;
         }
@@ -375,7 +537,7 @@ public class ResearchModeController : MonoBehaviour
                 continue;
             }
 
-            RawSensorTcpFrame frame = WaitForLatestSensorTcpFrame();
+            RawSensorFrame frame = WaitForLatestSensorTcpFrame();
             if (frame == null) continue;
 
             byte[] payload = BuildRawSensorTcpPayload(frame, ref sensorTcpPayloadBuffer);
@@ -396,23 +558,6 @@ public class ResearchModeController : MonoBehaviour
                 SetSensorTcpStatus($"TCP connection failed: server returned unexpected response '{responseText}'. Retrying {sensorTcpHost}:{sensorTcpPort} in {GetSensorTcpReconnectIntervalSeconds():0.0}s.");
                 SleepSensorTcpReconnectInterval();
                 continue;
-            }
-
-            try
-            {
-                List<Vector2> markerPixels = ParseServerMarkerPixelResponse(response);
-                lock (markerPixelsLock)
-                {
-                    latestMarkerPixelFrame = frame;
-                    latestMarkerPixels = markerPixels;
-                    newMarkerPixelsReceived = true;
-                }
-            }
-            catch (Exception ex)
-            {
-                DisconnectSensorTcpClient();
-                SetSensorTcpStatus($"TCP marker response parse failed: {ex.Message}. Retrying {sensorTcpHost}:{sensorTcpPort} in {GetSensorTcpReconnectIntervalSeconds():0.0}s.");
-                SleepSensorTcpReconnectInterval();
             }
         }
 
@@ -443,6 +588,7 @@ public class ResearchModeController : MonoBehaviour
         }
 
         sensorTcpClient = client;
+        sensorTcpConnected = true;
         SetSensorTcpStatus($"TCP connected to {host}:{port}.");
         return true;
     }
@@ -459,6 +605,7 @@ public class ResearchModeController : MonoBehaviour
 
     private void DisconnectSensorTcpClient()
     {
+        sensorTcpConnected = false;
         try { sensorTcpClient?.Dispose(); }
         catch { }
         sensorTcpClient = null;
@@ -491,71 +638,7 @@ public class ResearchModeController : MonoBehaviour
         }
     }
 
-    private static List<Vector2> ParseServerMarkerPixelResponse(byte[] response)
-    {
-        if (IsBinaryMarkerPixelResponse(response))
-        {
-            return ParseBinaryMarkerPixelResponse(response);
-        }
-
-        return ParseJsonMarkerPixelResponse(response);
-    }
-
-    private static bool IsBinaryMarkerPixelResponse(byte[] response)
-    {
-        if (response == null || response.Length < MarkerPixelResponseMagic.Length) return false;
-        for (int i = 0; i < MarkerPixelResponseMagic.Length; ++i)
-        {
-            if (response[i] != MarkerPixelResponseMagic[i]) return false;
-        }
-
-        return true;
-    }
-
-    private static List<Vector2> ParseBinaryMarkerPixelResponse(byte[] response)
-    {
-        const int headerBytes = 12;
-        const int pointBytes = 8;
-        if (response.Length < headerBytes) throw new ArgumentException("Marker response is too short.");
-
-        int offset = MarkerPixelResponseMagic.Length;
-        uint count = ReadUInt32LittleEndian(response, ref offset);
-        int expectedLength = headerBytes + checked((int)count * pointBytes);
-        if (response.Length != expectedLength)
-        {
-            throw new ArgumentException($"Marker response size mismatch: got {response.Length}, expected {expectedLength}.");
-        }
-
-        List<Vector2> markerPixels = new List<Vector2>((int)count);
-        for (int i = 0; i < count; ++i)
-        {
-            float pixelX = ReadFloatLittleEndian(response, ref offset);
-            float pixelY = ReadFloatLittleEndian(response, ref offset);
-            markerPixels.Add(new Vector2(pixelX, pixelY));
-        }
-
-        return markerPixels;
-    }
-
-    private static List<Vector2> ParseJsonMarkerPixelResponse(byte[] response)
-    {
-        string json = Encoding.UTF8.GetString(response);
-        JArray markerArray = JArray.Parse(json);
-        List<Vector2> markerPixels = new List<Vector2>();
-
-        foreach (var markerToken in markerArray)
-        {
-            if (!(markerToken is JArray marker) || marker.Count < 2) continue;
-
-            markerPixels.Add(new Vector2(
-                marker[0].ToObject<float>(),
-                marker[1].ToObject<float>()));
-        }
-
-        return markerPixels;
-    }
-
-    private static byte[] BuildRawSensorTcpPayload(RawSensorTcpFrame frame, ref byte[] payload)
+    private static byte[] BuildRawSensorTcpPayload(RawSensorFrame frame, ref byte[] payload)
     {
         int depthByteLength = SensorImagePixelCount * sizeof(ushort);
         int infraredByteLength = SensorImagePixelCount * sizeof(ushort);
@@ -633,37 +716,6 @@ public class ResearchModeController : MonoBehaviour
         WriteUInt64(target, ref offset, (ulong)BitConverter.DoubleToInt64Bits(value));
     }
 
-    private static uint ReadUInt32LittleEndian(byte[] source, ref int offset)
-    {
-        uint value = (uint)(
-            source[offset]
-            | (source[offset + 1] << 8)
-            | (source[offset + 2] << 16)
-            | (source[offset + 3] << 24));
-        offset += 4;
-        return value;
-    }
-
-    private static float ReadFloatLittleEndian(byte[] source, ref int offset)
-    {
-        if (BitConverter.IsLittleEndian)
-        {
-            float value = BitConverter.ToSingle(source, offset);
-            offset += 4;
-            return value;
-        }
-
-        byte[] valueBytes = new byte[]
-        {
-            source[offset + 3],
-            source[offset + 2],
-            source[offset + 1],
-            source[offset]
-        };
-        offset += 4;
-        return BitConverter.ToSingle(valueBytes, 0);
-    }
-
     private static double GetUnixTimeSeconds()
     {
         DateTime unixEpoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
@@ -672,7 +724,7 @@ public class ResearchModeController : MonoBehaviour
 
     private void ApplyLatestMarkerPixels()
     {
-        RawSensorTcpFrame markerFrame = null;
+        RawSensorFrame markerFrame = null;
         List<Vector2> markerPixels = null;
         lock (markerPixelsLock)
         {
@@ -685,9 +737,30 @@ public class ResearchModeController : MonoBehaviour
 
         List<Vector3> markerWorldPositions = ResolveMarkerWorldPositions(markerFrame, markerPixels);
         ReplaceMarkerWorldSpheres(markerWorldPositions);
+        UpdateAimToolModels(markerWorldPositions);
     }
 
-    private List<Vector3> ResolveMarkerWorldPositions(RawSensorTcpFrame frame, List<Vector2> markerPixels)
+    private void EnsureAimToolModelTracker()
+    {
+        if (AimToolTrackerScript != null) return;
+
+        AimToolTrackerScript = FindObjectOfType<AimToolModelTracker>();
+        if (AimToolTrackerScript != null) return;
+
+        GameObject trackerObject = new GameObject("AimToolModelTracker");
+        AimToolTrackerScript = trackerObject.AddComponent<AimToolModelTracker>();
+    }
+
+    private void UpdateAimToolModels(List<Vector3> markerWorldPositions)
+    {
+        EnsureAimToolModelTracker();
+        if (AimToolTrackerScript != null)
+        {
+            AimToolTrackerScript.UpdateObservedMarkers(markerWorldPositions);
+        }
+    }
+
+    private List<Vector3> ResolveMarkerWorldPositions(RawSensorFrame frame, List<Vector2> markerPixels)
     {
         List<Vector3> markerWorldPositions = new List<Vector3>();
         if (frame == null || markerPixels == null || frame.Depth == null || frame.DepthToWorldMatrix == null) return markerWorldPositions;
@@ -707,7 +780,7 @@ public class ResearchModeController : MonoBehaviour
     }
 
 #if ENABLE_WINMD_SUPPORT
-    private Vector3? ResolveMarkerWorldPosition(RawSensorTcpFrame frame, Vector2 markerPixel)
+    private Vector3? ResolveMarkerWorldPosition(RawSensorFrame frame, Vector2 markerPixel)
     {
         float depthValue = BilinearDepthAt(frame.Depth, markerPixel.x, markerPixel.y);
         if (depthValue <= 0f || depthValue > DepthMaxMm) return null;
@@ -770,28 +843,38 @@ public class ResearchModeController : MonoBehaviour
 
     private void ReplaceMarkerWorldSpheres(List<Vector3> markerWorldPositions)
     {
-        foreach (var sphere in markerWorldSpheres)
+        int activeCount = markerWorldPositions == null ? 0 : markerWorldPositions.Count;
+        for (int i = markerWorldSpheres.Count; i < activeCount; ++i)
         {
-            if (sphere != null) Destroy(sphere);
+            markerWorldSpheres.Add(CreateMarkerWorldSphere());
         }
 
-        markerWorldSpheres.Clear();
-
-        foreach (var position in markerWorldPositions)
+        for (int i = 0; i < markerWorldSpheres.Count; ++i)
         {
-            GameObject markerSphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-            markerSphere.name = "DetectedIRMarker";
-            markerSphere.transform.position = position;
-            markerSphere.transform.localScale = Vector3.one * MarkerSphereDiameterMetres;
+            GameObject markerSphere = markerWorldSpheres[i];
+            if (markerSphere == null) continue;
 
-            Collider collider = markerSphere.GetComponent<Collider>();
-            if (collider != null) Destroy(collider);
+            bool active = i < activeCount;
+            if (markerSphere.activeSelf != active) markerSphere.SetActive(active);
+            if (!active) continue;
 
-            Renderer renderer = markerSphere.GetComponent<Renderer>();
-            if (renderer != null) renderer.material = GetMarkerSphereMaterial();
-
-            markerWorldSpheres.Add(markerSphere);
+            markerSphere.transform.position = markerWorldPositions[i];
         }
+    }
+
+    private GameObject CreateMarkerWorldSphere()
+    {
+        GameObject markerSphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+        markerSphere.name = "DetectedIRMarker";
+        markerSphere.transform.localScale = Vector3.one * MarkerSphereDiameterMetres;
+
+        Collider collider = markerSphere.GetComponent<Collider>();
+        if (collider != null) Destroy(collider);
+
+        Renderer renderer = markerSphere.GetComponent<Renderer>();
+        if (renderer != null) renderer.material = GetMarkerSphereMaterial();
+
+        return markerSphere;
     }
 
     private Material GetMarkerSphereMaterial()
@@ -838,7 +921,12 @@ public class ResearchModeController : MonoBehaviour
         }
 
         double[] depthToWorldMatrix = researchMode.GetDepthToWorldMatrix();
-        QueueRawSensorFrameForTcp(depthFrameTexture, abFrameTexture, depthToWorldMatrix);
+        if (ShouldQueueLocalMarkerDetectionFrame() || ShouldQueueSensorTcpFrame())
+        {
+            RawSensorFrame frameSnapshot = CreateRawSensorFrameSnapshot(depthFrameTexture, abFrameTexture, depthToWorldMatrix);
+            QueueRawSensorFrameForLocalMarkerDetection(frameSnapshot);
+            QueueRawSensorFrameForTcp(frameSnapshot);
+        }
 
         nextSensorImageUploadTime = Time.unscaledTime + SensorImageUploadIntervalSeconds;
 #endif
@@ -944,6 +1032,7 @@ public class ResearchModeController : MonoBehaviour
 
     private void OnDestroy()
     {
+        StopLocalMarkerDetectionThread();
         StopSensorTcpThread();
     }
 
@@ -988,7 +1077,7 @@ public class ResearchModeController : MonoBehaviour
 #endif
     }
 
-    private class RawSensorTcpFrame
+    private class RawSensorFrame
     {
         public ushort[] Depth;
         public ushort[] Infrared;

@@ -37,9 +37,9 @@ Original projects:
 
 This project can stream the HoloLens 2 raw 16-bit depth image and raw 16-bit infrared image to a Python TCP server in real time. Each frame contains two `512 x 512` `uint16` images and the depth-to-world matrix. The Unity client sends frames from a background thread so the main Unity update loop is not blocked by TCP transfer. The C# client uses the `simple_tcp_server` L framing mode: one `L` negotiation byte when the socket connects, then `4-byte big-endian payload length + raw payload` for each request and response.
 
-The raw sensor request is the only TCP protocol used for marker coordinates. For each `raw_stream:` request, the server detects marker balls in the current infrared frame and returns a compact binary `DINOUV01` response containing the current-frame marker count followed by float32 image coordinates `u, v`. The HoloLens client converts those image coordinates to 3D Unity positions locally with the same-frame depth image, depth-to-world matrix, and per-marker `MapImagePointToCameraUnitPlane` calls. The full per-pixel unit-plane lookup table is not generated or transmitted.
+The Unity client detects marker balls locally from the same 16-bit infrared frame using a C# port of `ir_yolo_tracker.ThresholdMarkerDetector`. It then converts those local 2D image coordinates to 3D Unity positions with the same-frame depth image, depth-to-world matrix, and per-marker `MapImagePointToCameraUnitPlane` calls. The full per-pixel unit-plane lookup table is not generated or transmitted.
 
-The Unity client parses that response immediately, resolves marker sphere positions from the current frame, and updates the red semi-transparent marker spheres. There is no separate marker polling connection or server-side coordinate cache.
+The TCP stream is still sent to the Python server so the server can show the raw sensor visualization, run its own marker detection for diagnostics, and report server-side response latency. The server still returns a compact `DINOUV01` marker response, but the Unity client intentionally ignores those marker positions. Red semi-transparent marker spheres are driven by Unity-side detection and projection only.
 
 The default server address is:
 
@@ -85,6 +85,9 @@ The provided scenes already enable this stream on `Managers/RM_Manager`, which c
 - `Sensor Tcp Port`: the Python server port. Default: `8888`.
 - `Sensor Tcp Frame Interval Seconds`: target send interval. Default: `0.033333335`, about 30 FPS (24 FPS in real-world use).
 - `Sensor Tcp Reconnect Interval Seconds`: reconnect delay after a failed connection attempt.
+- `Detect Markers In Unity`: run the local threshold marker detector. Default: enabled.
+- `Local Marker Detection Interval Seconds`: target local detection interval. Default: `0.033333335`, about 30 FPS.
+- `Local Threshold *`: Unity-side threshold detector parameters. Defaults mirror the server's threshold config.
 
 Start the Python server from the repository root before launching the HoloLens app:
 
@@ -114,7 +117,7 @@ When the HoloLens client connects, it prints a line like:
 [2026-06-06 22:00:00.000000] Client connected from <client-ip>:<client-port>
 ```
 
-For every received frame, the server converts the depth and infrared payloads to NumPy arrays with shape `(512, 512)`, runs marker detection, and returns marker image coordinates in the TCP response. Per-frame terminal logging is disabled by default; pass `--print-frame-log` to print the receive timestamp, frame sequence number, client timestamp, FPS, processing time, and array shapes. The server also opens an OpenCV visualization window. The left image is depth, where near pixels are bright and far pixels are dark. The right image is infrared, normalized per frame with min-max scaling. Press `Q`, `Esc`, or `Ctrl+C` in the terminal to stop the server.
+For every received frame, the server converts the depth and infrared payloads to NumPy arrays with shape `(512, 512)`, runs marker detection for diagnostics, and returns marker image coordinates in the TCP response. Unity ignores those returned marker coordinates. Per-frame terminal logging is disabled by default; pass `--print-frame-log` to print the receive timestamp, frame sequence number, client timestamp, FPS, processing time, and array shapes. The server also opens an OpenCV visualization window. The left image is depth, where near pixels are bright and far pixels are dark. The right image is infrared, normalized per frame with min-max scaling. Press `Q`, `Esc`, or `Ctrl+C` in the terminal to stop the server.
 
 The visualization overlay shows average server response latency in milliseconds. This latency is measured from the moment the Python server has received a complete request frame to the moment `sendall()` successfully returns after writing the response to the socket. Pass `--print-response-latency` to print one latency line immediately after each response is sent.
 
