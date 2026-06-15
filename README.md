@@ -121,6 +121,12 @@ For every received frame, the server converts the depth and infrared payloads to
 
 The visualization overlay shows average server response latency in milliseconds. This latency is measured from the moment the Python server has received a complete request frame to the moment `sendall()` successfully returns after writing the response to the socket. Pass `--print-response-latency` to print one latency line immediately after each response is sent.
 
+### AimTool Model Tracking
+
+AimTool source files live under the repository-level `AimTools` folder. Treat every `.aimtool` marker coordinate and every matching `.stl` vertex as original right-handed millimetre data; do not edit those source files to make them look like Unity coordinates.
+
+Use `DINO Unity > Import AimTools` in the Unity editor to regenerate runtime assets. The importer parses each `.aimtool`, converts the marker points from right-handed millimetres to Unity left-handed metres, converts the matching `.stl` to an `.obj` under `DINO-Unity-21/Assets/Resources/AimTools`, and compensates for Unity's OBJ import axis handling so the imported mesh lands in the same left-handed coordinate frame as the generated marker JSON. Runtime matching and rendering only use those generated `Resources/AimTools` assets.
+
 When raw image saving is enabled, the server creates the `IRData` folder in the project root if it does not already exist. Saving runs on a background writer thread so disk I/O does not block the TCP server receive loop. Depth images are saved under `IRData/depth`, and infrared images are saved under `IRData/infrared`. Each file contains one NumPy `uint16` array with shape `(512, 512)`, serialized with Python `pickle`. File names use a 7-digit decimal counter with leading zeros, such as `0000001.pickle`, `0000002.pickle`, and so on. The depth and infrared files with the same number belong to the same received frame.
 
 You can load a saved image like this:

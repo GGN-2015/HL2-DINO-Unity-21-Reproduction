@@ -93,16 +93,25 @@ public static class AimToolAssetImporter
             if (!float.TryParse(parts[1], NumberStyles.Float, InvariantCulture, out y)) return false;
             if (!float.TryParse(parts[2], NumberStyles.Float, InvariantCulture, out z)) return false;
 
-            markers.Add(ConvertRightHandedMillimetresToUnityMetres(x, y, z));
+            markers.Add(ConvertRightHandedPointToUnityMetres(x, y, z));
         }
 
         return true;
     }
 
-    private static Vector3 ConvertRightHandedMillimetresToUnityMetres(float x, float y, float z)
+    private static Vector3 ConvertRightHandedPointToUnityMetres(float x, float y, float z)
     {
         const float millimetresToMetres = 0.001f;
         return new Vector3(x * millimetresToMetres, y * millimetresToMetres, -z * millimetresToMetres);
+    }
+
+    private static Vector3 ConvertRightHandedStlVertexToObjMetres(float x, float y, float z)
+    {
+        const float millimetresToMetres = 0.001f;
+        // Unity's OBJ importer applies its own handedness compensation on import.
+        // Pre-flip X here so the imported mesh lands in the same Unity left-handed
+        // coordinates as the marker JSON above.
+        return new Vector3(-x * millimetresToMetres, y * millimetresToMetres, -z * millimetresToMetres);
     }
 
     private static void ConvertStlToObj(string stlPath, string objPath, string modelName)
@@ -160,7 +169,7 @@ public static class AimToolAssetImporter
             WriteObjVertex(writer, a);
             WriteObjVertex(writer, b);
             WriteObjVertex(writer, c);
-            writer.WriteLine("f {0} {1} {2}", vertexIndex + 2, vertexIndex + 1, vertexIndex);
+            writer.WriteLine("f {0} {1} {2}", vertexIndex, vertexIndex + 1, vertexIndex + 2);
             vertexIndex += 3;
         }
     }
@@ -189,13 +198,13 @@ public static class AimToolAssetImporter
                 if (!float.TryParse(parts[2], NumberStyles.Float, InvariantCulture, out y)) continue;
                 if (!float.TryParse(parts[3], NumberStyles.Float, InvariantCulture, out z)) continue;
 
-                triangle.Add(ConvertRightHandedMillimetresToUnityMetres(x, y, z));
+                triangle.Add(ConvertRightHandedStlVertexToObjMetres(x, y, z));
                 if (triangle.Count == 3)
                 {
                     WriteObjVertex(writer, triangle[0]);
                     WriteObjVertex(writer, triangle[1]);
                     WriteObjVertex(writer, triangle[2]);
-                    writer.WriteLine("f {0} {1} {2}", vertexIndex + 2, vertexIndex + 1, vertexIndex);
+                    writer.WriteLine("f {0} {1} {2}", vertexIndex, vertexIndex + 1, vertexIndex + 2);
                     vertexIndex += 3;
                     triangle.Clear();
                 }
@@ -208,7 +217,7 @@ public static class AimToolAssetImporter
         float x = BitConverter.ToSingle(bytes, offset);
         float y = BitConverter.ToSingle(bytes, offset + 4);
         float z = BitConverter.ToSingle(bytes, offset + 8);
-        return ConvertRightHandedMillimetresToUnityMetres(x, y, z);
+        return ConvertRightHandedStlVertexToObjMetres(x, y, z);
     }
 
     private static void WriteObjVertex(StreamWriter writer, Vector3 vertex)
