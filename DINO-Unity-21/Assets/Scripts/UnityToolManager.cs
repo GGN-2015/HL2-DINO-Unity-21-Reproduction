@@ -1,7 +1,6 @@
 ﻿using System.Collections.Generic;
 using UnityEngine;
 using ToolTrackingUtils;
-using System.Linq;
 
 /** @file           UnityToolManager.cs
  *  @brief          Main Unity script for processing encoded double arrays passed in from the HL2-DINO-DLL
@@ -55,6 +54,9 @@ public class UnityToolManager : MonoBehaviour
     /// A double array to dump the latest encoded message from the HL2 into
     /// </summary>
     private double[] LatestDoubleArray;
+    private double[] ToolUpdateBuffer;
+    private readonly double[] toolMatrixElements = new double[16];
+    private readonly List<int> toolDictionaryKeys = new List<int>();
     private readonly object doubleArrayLock = new object();
     private volatile bool NewToolArrayReceived;
 
@@ -76,6 +78,8 @@ public class UnityToolManager : MonoBehaviour
 
         // 18 elements per tool (2 informational bits + 16 doubles for the transform matrix)
         LatestDoubleArray = new double[ToolDictionary.Count * 18];
+        ToolUpdateBuffer = new double[LatestDoubleArray.Length];
+        toolDictionaryKeys.AddRange(ToolDictionary.Keys);
     }
 
     void HideBuiltInToolModels()
@@ -125,12 +129,16 @@ public class UnityToolManager : MonoBehaviour
         // what's the time now?
         float currentTimestamp = ScriptTimer.ElapsedMilliseconds;
 
-        foreach (var tool in ToolDictionary.ToArray())
+        for (int i = 0; i < toolDictionaryKeys.Count; ++i)
         {
+            int toolKey = toolDictionaryKeys[i];
             Matrix4x4 targetPoseUnity = Matrix4x4.identity;
             TrackedTool trackedTool;
 
-            trackedTool = tool.Value;
+            lock (toolDictLock)
+            {
+                if (!ToolDictionary.TryGetValue(toolKey, out trackedTool)) continue;
+            }
 
             if (trackedTool.VisibleToHoloLens)
             {
@@ -151,7 +159,7 @@ public class UnityToolManager : MonoBehaviour
             lock (toolDictLock)
             {
                 // we've updated the tool's transform, so update the tool's entry in the dictionary 
-                if (ToolDictionary.ContainsKey(tool.Key)) ToolDictionary[tool.Key] = trackedTool;
+                if (ToolDictionary.ContainsKey(toolKey)) ToolDictionary[toolKey] = trackedTool;
             }
         }
     }
@@ -187,31 +195,27 @@ public class UnityToolManager : MonoBehaviour
     {
         if (!NewToolArrayReceived) { return; }
 
-        // variable for entire 'packet'
-        double[] matTransforms = new double[LatestDoubleArray.Length];
-
         // variables per-tool
         int toolID;
         bool visible2Holo;
-        double[] toolMatrixElements = new double[16];
 
         lock (doubleArrayLock)
         {
             // dump into matTransforms for processing
-            System.Buffer.BlockCopy(LatestDoubleArray, 0, matTransforms, 0, LatestDoubleArray.Length * sizeof(double));
+            System.Buffer.BlockCopy(LatestDoubleArray, 0, ToolUpdateBuffer, 0, LatestDoubleArray.Length * sizeof(double));
             NewToolArrayReceived = false; // consumed, so reset the flag
         }
         // expected packet format for each tool:
         // [1 element: tool ID, 1 element: Visibility (0 - False, 1 - True), 16 mat elements] | total 18 elements
-        int numberOfTools = matTransforms.Length / 18;
+        int numberOfTools = ToolUpdateBuffer.Length / 18;
 
         for (int i = 0; i < numberOfTools; i++)
         {
-            toolID = (int)(matTransforms[i * 18]); // casting from double to int
-            visible2Holo = ((int)(matTransforms[i * 18 + 1]) != 0); // cast from double to bool
+            toolID = (int)(ToolUpdateBuffer[i * 18]); // casting from double to int
+            visible2Holo = ((int)(ToolUpdateBuffer[i * 18 + 1]) != 0); // cast from double to bool
 
             // move pose matrix from the main array into the 'tool' array
-            for (int k = 0; k < 16; k++) toolMatrixElements[k] = matTransforms[i * 18 + 2 + k];
+            for (int k = 0; k < 16; k++) toolMatrixElements[k] = ToolUpdateBuffer[i * 18 + 2 + k];
 
             // grab the right-handed tool pose matrix, which we are expecting to be in a column-major 
             // format, and also in metres

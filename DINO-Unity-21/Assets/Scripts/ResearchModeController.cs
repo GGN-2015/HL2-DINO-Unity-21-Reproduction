@@ -108,6 +108,7 @@ public class ResearchModeController : MonoBehaviour
     private Thread sensorTcpThread = null;
     private SimpleTcpClient sensorTcpClient = null;
     private byte[] sensorTcpPayloadBuffer = null;
+    private byte[] sensorTcpResponseBuffer = null;
     private RawSensorFrame latestSensorTcpFrame = null;
     private readonly object sensorTcpFrameLock = new object();
     private readonly object sensorTcpStatusLock = new object();
@@ -116,15 +117,20 @@ public class ResearchModeController : MonoBehaviour
     private readonly object markerPixelsLock = new object();
     private RawSensorFrame latestMarkerPixelFrame = null;
     private List<Vector2> latestMarkerPixels = new List<Vector2>();
+    private readonly List<Vector2> markerPixelsApplyBuffer = new List<Vector2>(ThresholdMarkerDetector.DefaultMaxDetections);
     private bool newMarkerPixelsReceived = false;
     private readonly object localMarkerFrameLock = new object();
     private RawSensorFrame latestLocalMarkerFrame = null;
     private volatile bool localMarkerDetectionRunning = false;
     private Thread localMarkerDetectionThread = null;
     private ThresholdMarkerDetector localMarkerDetector = null;
+    private readonly List<Vector2> localMarkerDetectorOutput = new List<Vector2>(ThresholdMarkerDetector.DefaultMaxDetections);
     private float nextLocalMarkerDetectionQueueTime = 0f;
     private readonly List<GameObject> markerWorldSpheres = new List<GameObject>();
+    private readonly List<Vector3> markerWorldPositionsBuffer = new List<Vector3>(ThresholdMarkerDetector.DefaultMaxDetections);
     private Material markerSphereMaterial = null;
+    private readonly Stack<RawSensorFrame> rawSensorFramePool = new Stack<RawSensorFrame>(3);
+    private readonly object rawSensorFramePoolLock = new object();
 
     /// <summary>
     /// Use to internally track if sensor images are updated, but also pass this into \p HL2ResearchMode to 
@@ -302,7 +308,17 @@ public class ResearchModeController : MonoBehaviour
         }
 
         localMarkerDetectionThread = null;
+        RawSensorFrame staleFrame = latestLocalMarkerFrame;
         latestLocalMarkerFrame = null;
+        ReleaseRawSensorFrame(staleFrame);
+
+        lock (markerPixelsLock)
+        {
+            ReleaseRawSensorFrame(latestMarkerPixelFrame);
+            latestMarkerPixelFrame = null;
+            latestMarkerPixels.Clear();
+            newMarkerPixelsReceived = false;
+        }
     }
 
     private void QueueRawSensorFrameForLocalMarkerDetection(RawSensorFrame frame)
@@ -316,6 +332,8 @@ public class ResearchModeController : MonoBehaviour
 
         lock (localMarkerFrameLock)
         {
+            ReleaseRawSensorFrame(latestLocalMarkerFrame);
+            frame.Retain();
             latestLocalMarkerFrame = frame;
             Monitor.Pulse(localMarkerFrameLock);
         }
@@ -373,17 +391,24 @@ public class ResearchModeController : MonoBehaviour
 
             try
             {
-                List<Vector2> markerPixels = localMarkerDetector.DetectCenters(frame.Infrared);
+                localMarkerDetector.DetectCenters(frame.Infrared, localMarkerDetectorOutput);
                 lock (markerPixelsLock)
                 {
+                    ReleaseRawSensorFrame(latestMarkerPixelFrame);
                     latestMarkerPixelFrame = frame;
-                    latestMarkerPixels = markerPixels;
+                    frame = null;
+                    latestMarkerPixels.Clear();
+                    latestMarkerPixels.AddRange(localMarkerDetectorOutput);
                     newMarkerPixelsReceived = true;
                 }
             }
             catch (Exception ex)
             {
                 SetSensorTcpStatus($"Local marker detection failed: {ex.Message}");
+            }
+            finally
+            {
+                ReleaseRawSensorFrame(frame);
             }
         }
     }
@@ -420,8 +445,11 @@ public class ResearchModeController : MonoBehaviour
         }
 
         sensorTcpThread = null;
+        RawSensorFrame staleFrame = latestSensorTcpFrame;
         latestSensorTcpFrame = null;
+        ReleaseRawSensorFrame(staleFrame);
         sensorTcpPayloadBuffer = null;
+        sensorTcpResponseBuffer = null;
     }
 
     private void SetSensorTcpStatus(string message)
@@ -453,27 +481,44 @@ public class ResearchModeController : MonoBehaviour
         }
     }
 
-    private RawSensorFrame CreateRawSensorFrameSnapshot(ushort[] depthFrame, ushort[] infraredFrame, double[] depthToWorldMatrix)
+    private RawSensorFrame AcquireRawSensorFrameSnapshot(ushort[] depthFrame, ushort[] infraredFrame, double[] depthToWorldMatrix)
     {
         if (depthFrame == null || infraredFrame == null) return null;
         if (depthFrame.Length < SensorImagePixelCount || infraredFrame.Length < SensorImagePixelCount) return null;
         if (depthToWorldMatrix == null || depthToWorldMatrix.Length < SensorTcpDepthToWorldMatrixValues) return null;
 
-        double[] matrixCopy = new double[SensorTcpDepthToWorldMatrixValues];
-        Array.Copy(depthToWorldMatrix, matrixCopy, SensorTcpDepthToWorldMatrixValues);
-        ushort[] depthCopy = new ushort[SensorImagePixelCount];
-        ushort[] infraredCopy = new ushort[SensorImagePixelCount];
-        Array.Copy(depthFrame, depthCopy, SensorImagePixelCount);
-        Array.Copy(infraredFrame, infraredCopy, SensorImagePixelCount);
+        RawSensorFrame frame = AcquireRawSensorFrame();
+        Array.Copy(depthToWorldMatrix, frame.DepthToWorldMatrix, SensorTcpDepthToWorldMatrixValues);
+        Array.Copy(depthFrame, frame.Depth, SensorImagePixelCount);
+        Array.Copy(infraredFrame, frame.Infrared, SensorImagePixelCount);
+        frame.Sequence = ++sensorTcpFrameSequence;
+        frame.TimestampUnixSeconds = GetUnixTimeSeconds();
+        frame.ReferenceCount = 1;
+        return frame;
+    }
 
-        return new RawSensorFrame
+    private RawSensorFrame AcquireRawSensorFrame()
+    {
+        lock (rawSensorFramePoolLock)
         {
-            Depth = depthCopy,
-            Infrared = infraredCopy,
-            DepthToWorldMatrix = matrixCopy,
-            Sequence = ++sensorTcpFrameSequence,
-            TimestampUnixSeconds = GetUnixTimeSeconds()
-        };
+            if (rawSensorFramePool.Count > 0)
+            {
+                return rawSensorFramePool.Pop();
+            }
+        }
+
+        return new RawSensorFrame(SensorImagePixelCount, SensorTcpDepthToWorldMatrixValues);
+    }
+
+    private void ReleaseRawSensorFrame(RawSensorFrame frame)
+    {
+        if (frame == null) return;
+        if (!frame.Release()) return;
+
+        lock (rawSensorFramePoolLock)
+        {
+            rawSensorFramePool.Push(frame);
+        }
     }
 
     private bool ShouldQueueLocalMarkerDetectionFrame()
@@ -502,6 +547,8 @@ public class ResearchModeController : MonoBehaviour
 
         lock (sensorTcpFrameLock)
         {
+            ReleaseRawSensorFrame(latestSensorTcpFrame);
+            frame.Retain();
             latestSensorTcpFrame = frame;
             Monitor.Pulse(sensorTcpFrameLock);
         }
@@ -541,28 +588,33 @@ public class ResearchModeController : MonoBehaviour
             if (frame == null) continue;
 
             byte[] payload = BuildRawSensorTcpPayload(frame, ref sensorTcpPayloadBuffer);
-            byte[] response = sensorTcpClient.Request(payload);
-            if (response == null)
+            int responseLength = sensorTcpClient.Request(payload, ref sensorTcpResponseBuffer);
+            if (responseLength < 0)
             {
                 string reason = GetSensorTcpErrorReason(sensorTcpClient);
                 DisconnectSensorTcpClient();
                 SetSensorTcpStatus($"TCP connection failed: {reason}. Retrying {sensorTcpHost}:{sensorTcpPort} in {GetSensorTcpReconnectIntervalSeconds():0.0}s.");
+                ReleaseRawSensorFrame(frame);
                 SleepSensorTcpReconnectInterval();
                 continue;
             }
 
-            if (IsErrorSensorTcpResponse(response))
+            if (IsErrorSensorTcpResponse(sensorTcpResponseBuffer, responseLength))
             {
-                string responseText = Encoding.ASCII.GetString(response);
+                string responseText = Encoding.ASCII.GetString(sensorTcpResponseBuffer, 0, responseLength);
                 DisconnectSensorTcpClient();
                 SetSensorTcpStatus($"TCP connection failed: server returned unexpected response '{responseText}'. Retrying {sensorTcpHost}:{sensorTcpPort} in {GetSensorTcpReconnectIntervalSeconds():0.0}s.");
+                ReleaseRawSensorFrame(frame);
                 SleepSensorTcpReconnectInterval();
                 continue;
             }
+
+            ReleaseRawSensorFrame(frame);
         }
 
         DisconnectSensorTcpClient();
         sensorTcpPayloadBuffer = null;
+        sensorTcpResponseBuffer = null;
     }
 
     private bool EnsureSensorTcpConnected()
@@ -617,9 +669,9 @@ public class ResearchModeController : MonoBehaviour
         return client.LastError;
     }
 
-    private static bool IsErrorSensorTcpResponse(byte[] response)
+    private static bool IsErrorSensorTcpResponse(byte[] response, int responseLength)
     {
-        return response != null && response.Length == 5
+        return response != null && responseLength == 5
             && response[0] == (byte)'e'
             && response[1] == (byte)'r'
             && response[2] == (byte)'r'
@@ -725,19 +777,21 @@ public class ResearchModeController : MonoBehaviour
     private void ApplyLatestMarkerPixels()
     {
         RawSensorFrame markerFrame = null;
-        List<Vector2> markerPixels = null;
+        markerPixelsApplyBuffer.Clear();
         lock (markerPixelsLock)
         {
             if (!newMarkerPixelsReceived) return;
 
             markerFrame = latestMarkerPixelFrame;
-            markerPixels = new List<Vector2>(latestMarkerPixels);
+            latestMarkerPixelFrame = null;
+            markerPixelsApplyBuffer.AddRange(latestMarkerPixels);
             newMarkerPixelsReceived = false;
         }
 
-        List<Vector3> markerWorldPositions = ResolveMarkerWorldPositions(markerFrame, markerPixels);
-        ReplaceMarkerWorldSpheres(markerWorldPositions);
-        UpdateAimToolModels(markerWorldPositions);
+        ResolveMarkerWorldPositions(markerFrame, markerPixelsApplyBuffer, markerWorldPositionsBuffer);
+        ReplaceMarkerWorldSpheres(markerWorldPositionsBuffer);
+        UpdateAimToolModels(markerWorldPositionsBuffer);
+        ReleaseRawSensorFrame(markerFrame);
     }
 
     private void EnsureAimToolModelTracker()
@@ -760,10 +814,10 @@ public class ResearchModeController : MonoBehaviour
         }
     }
 
-    private List<Vector3> ResolveMarkerWorldPositions(RawSensorFrame frame, List<Vector2> markerPixels)
+    private void ResolveMarkerWorldPositions(RawSensorFrame frame, List<Vector2> markerPixels, List<Vector3> markerWorldPositions)
     {
-        List<Vector3> markerWorldPositions = new List<Vector3>();
-        if (frame == null || markerPixels == null || frame.Depth == null || frame.DepthToWorldMatrix == null) return markerWorldPositions;
+        markerWorldPositions.Clear();
+        if (frame == null || markerPixels == null || frame.Depth == null || frame.DepthToWorldMatrix == null) return;
 
 #if ENABLE_WINMD_SUPPORT
         foreach (Vector2 markerPixel in markerPixels)
@@ -775,8 +829,6 @@ public class ResearchModeController : MonoBehaviour
             }
         }
 #endif
-
-        return markerWorldPositions;
     }
 
 #if ENABLE_WINMD_SUPPORT
@@ -923,9 +975,10 @@ public class ResearchModeController : MonoBehaviour
         double[] depthToWorldMatrix = researchMode.GetDepthToWorldMatrix();
         if (ShouldQueueLocalMarkerDetectionFrame() || ShouldQueueSensorTcpFrame())
         {
-            RawSensorFrame frameSnapshot = CreateRawSensorFrameSnapshot(depthFrameTexture, abFrameTexture, depthToWorldMatrix);
+            RawSensorFrame frameSnapshot = AcquireRawSensorFrameSnapshot(depthFrameTexture, abFrameTexture, depthToWorldMatrix);
             QueueRawSensorFrameForLocalMarkerDetection(frameSnapshot);
             QueueRawSensorFrameForTcp(frameSnapshot);
+            ReleaseRawSensorFrame(frameSnapshot);
         }
 
         nextSensorImageUploadTime = Time.unscaledTime + SensorImageUploadIntervalSeconds;
@@ -1077,13 +1130,31 @@ public class ResearchModeController : MonoBehaviour
 #endif
     }
 
-    private class RawSensorFrame
+    private sealed class RawSensorFrame
     {
-        public ushort[] Depth;
-        public ushort[] Infrared;
-        public double[] DepthToWorldMatrix;
+        public readonly ushort[] Depth;
+        public readonly ushort[] Infrared;
+        public readonly double[] DepthToWorldMatrix;
         public ulong Sequence;
         public double TimestampUnixSeconds;
+        public int ReferenceCount;
+
+        public RawSensorFrame(int pixelCount, int matrixValueCount)
+        {
+            Depth = new ushort[pixelCount];
+            Infrared = new ushort[pixelCount];
+            DepthToWorldMatrix = new double[matrixValueCount];
+        }
+
+        public void Retain()
+        {
+            Interlocked.Increment(ref ReferenceCount);
+        }
+
+        public bool Release()
+        {
+            return Interlocked.Decrement(ref ReferenceCount) == 0;
+        }
     }
 
 }
