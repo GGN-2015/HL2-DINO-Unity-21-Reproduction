@@ -104,7 +104,6 @@ public sealed class AimToolModelTracker : MonoBehaviour
                 LastMatchTime = float.NegativeInfinity,
                 HasSmoothedPose = false
             };
-            model.MatchTemplate = AimToolMatchTemplate.Create(model.MarkerLocalPositions);
 
             models.Add(model);
         }
@@ -138,7 +137,7 @@ public sealed class AimToolModelTracker : MonoBehaviour
             AimToolRigidMatch match;
             bool matched = AimToolRigidMatcher.TryFindBestMatch(
                 observed,
-                model.MatchTemplate,
+                model.MarkerLocalPositions,
                 maxMarkerErrorMetres,
                 distanceTolerance,
                 maxSearchNodesPerTool,
@@ -425,7 +424,6 @@ public sealed class AimToolModelTracker : MonoBehaviour
         public GameObject Prefab;
         public GameObject Instance;
         public List<Vector3> MarkerLocalPositions;
-        public AimToolMatchTemplate MatchTemplate;
         public float LastMatchTime;
         public bool HasSmoothedPose;
         public Vector3 SmoothedPosition;
@@ -457,28 +455,6 @@ public struct AimToolRigidMatch
     public ulong ObservedMask;
 }
 
-public sealed class AimToolMatchTemplate
-{
-    public IList<Vector3> Points { get; private set; }
-    public float[,] PairwiseDistances { get; private set; }
-    public int[] SearchOrder { get; private set; }
-
-    private AimToolMatchTemplate()
-    {
-    }
-
-    public static AimToolMatchTemplate Create(IList<Vector3> points)
-    {
-        float[,] distances = AimToolRigidMatcher.PairwiseDistances(points);
-        return new AimToolMatchTemplate
-        {
-            Points = points,
-            PairwiseDistances = distances,
-            SearchOrder = AimToolRigidMatcher.BuildTemplateSearchOrder(points, distances)
-        };
-    }
-}
-
 public static class AimToolRigidMatcher
 {
     public static bool TryFindBestMatch(
@@ -489,46 +465,24 @@ public static class AimToolRigidMatcher
         int maxSearchNodes,
         out AimToolRigidMatch bestMatch)
     {
-        if (templatePoints == null)
-        {
-            bestMatch = new AimToolRigidMatch();
-            return false;
-        }
-
-        return TryFindBestMatch(
-            observedPoints,
-            AimToolMatchTemplate.Create(templatePoints),
-            maxError,
-            distanceTolerance,
-            maxSearchNodes,
-            out bestMatch);
-    }
-
-    public static bool TryFindBestMatch(
-        IList<Vector3> observedPoints,
-        AimToolMatchTemplate template,
-        float maxError,
-        float distanceTolerance,
-        int maxSearchNodes,
-        out AimToolRigidMatch bestMatch)
-    {
         bestMatch = new AimToolRigidMatch();
 
-        if (observedPoints == null || template == null || template.Points == null) return false;
-        IList<Vector3> templatePoints = template.Points;
+        if (observedPoints == null || templatePoints == null) return false;
         int observedCount = observedPoints.Count;
         int templateCount = templatePoints.Count;
         if (templateCount < 3 || observedCount < templateCount || observedCount > 63) return false;
         if (maxError < 0f || distanceTolerance < 0f) return false;
 
+        float[,] templateDistances = PairwiseDistances(templatePoints);
         float[,] observedDistances = PairwiseDistances(observedPoints);
-        ulong[,,] compatibleMasks = BuildCompatibleMasks(templateCount, observedCount, template.PairwiseDistances, observedDistances, distanceTolerance);
+        int[] templateOrder = BuildTemplateSearchOrder(templatePoints, templateDistances);
+        ulong[,,] compatibleMasks = BuildCompatibleMasks(templateCount, observedCount, templateDistances, observedDistances, distanceTolerance);
 
         SearchState state = new SearchState
         {
             ObservedPoints = observedPoints,
             TemplatePoints = templatePoints,
-            TemplateOrder = template.SearchOrder,
+            TemplateOrder = templateOrder,
             CompatibleMasks = compatibleMasks,
             AssignmentByOrder = CreateFilledArray(templateCount, -1),
             AssignmentByTemplate = CreateFilledArray(templateCount, -1),
@@ -794,7 +748,7 @@ public static class AimToolRigidMatcher
         };
     }
 
-    public static float[,] PairwiseDistances(IList<Vector3> points)
+    private static float[,] PairwiseDistances(IList<Vector3> points)
     {
         int count = points.Count;
         float[,] distances = new float[count, count];
@@ -844,7 +798,7 @@ public static class AimToolRigidMatcher
         return masks;
     }
 
-    public static int[] BuildTemplateSearchOrder(IList<Vector3> points, float[,] distances)
+    private static int[] BuildTemplateSearchOrder(IList<Vector3> points, float[,] distances)
     {
         int count = points.Count;
         int[] order = new int[count];

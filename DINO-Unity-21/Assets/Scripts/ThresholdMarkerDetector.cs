@@ -52,14 +52,12 @@ public sealed class ThresholdMarkerDetector
     private readonly int maxDetections;
 
     private readonly int[] histogram = new int[HistogramBins];
-    private readonly ushort[] histogramTouchedBins;
     private readonly byte[] binary;
     private readonly int[] labels;
     private readonly int[] floodQueue;
-    private byte[] morphologyBufferA;
-    private byte[] morphologyBufferB;
+    private readonly byte[] morphologyBufferA;
+    private readonly byte[] morphologyBufferB;
     private readonly List<Detection> detections = new List<Detection>(DefaultMaxDetections);
-    private int componentLabelBase = 0;
 
     public ThresholdMarkerDetector(
         int width,
@@ -123,23 +121,15 @@ public sealed class ThresholdMarkerDetector
         binary = new byte[pixelCount];
         labels = new int[pixelCount];
         floodQueue = new int[pixelCount];
-        histogramTouchedBins = new ushort[Math.Min(pixelCount, HistogramBins)];
+        morphologyBufferA = new byte[pixelCount];
+        morphologyBufferB = new byte[pixelCount];
     }
 
     public List<Vector2> DetectCenters(ushort[] frame)
     {
-        List<Vector2> centers = new List<Vector2>();
-        DetectCenters(frame, centers);
-        return centers;
-    }
-
-    public void DetectCenters(ushort[] frame, List<Vector2> centers)
-    {
         if (frame == null) throw new ArgumentNullException(nameof(frame));
         if (frame.Length < pixelCount) throw new ArgumentException("Frame is smaller than the configured image size.");
-        if (centers == null) throw new ArgumentNullException(nameof(centers));
 
-        centers.Clear();
         detections.Clear();
 
         ushort frameMin;
@@ -148,7 +138,7 @@ public sealed class ThresholdMarkerDetector
         int compareThreshold = Math.Max(threshold, 1);
         if (frameMax <= 0 || frameMax == frameMin || frameMax < compareThreshold)
         {
-            return;
+            return new List<Vector2>();
         }
 
         int foregroundCount = BuildBinary(frame, compareThreshold, includeEqual: true);
@@ -161,31 +151,30 @@ public sealed class ThresholdMarkerDetector
         ApplyMorphologyIfNeeded();
         FindDetections(frame, threshold, frameMax);
 
-        detections.Sort(CompareDetectionConfidenceDescending);
+        detections.Sort((left, right) => right.Confidence.CompareTo(left.Confidence));
         if (maxDetections > 0 && detections.Count > maxDetections)
         {
             detections.RemoveRange(maxDetections, detections.Count - maxDetections);
         }
 
+        List<Vector2> centers = new List<Vector2>(detections.Count);
         for (int i = 0; i < detections.Count; ++i)
         {
             centers.Add(detections[i].Center);
         }
+
+        return centers;
     }
 
     private int ResolveThreshold(ushort[] frame, out ushort frameMin, out ushort frameMax)
     {
+        Array.Clear(histogram, 0, histogram.Length);
+
         frameMin = ushort.MaxValue;
         frameMax = ushort.MinValue;
-        int touchedCount = 0;
         for (int i = 0; i < pixelCount; ++i)
         {
             ushort value = frame[i];
-            if (histogram[value] == 0)
-            {
-                histogramTouchedBins[touchedCount++] = value;
-            }
-
             histogram[value]++;
             if (value < frameMin) frameMin = value;
             if (value > frameMax) frameMax = value;
@@ -205,7 +194,7 @@ public sealed class ThresholdMarkerDetector
             int targetIndex = (int)Math.Floor((thresholdPercentile / 100.0) * (pixelCount - 1));
             int cumulative = 0;
             threshold = frameMax;
-            for (int value = frameMin; value <= frameMax; ++value)
+            for (int value = 0; value < histogram.Length; ++value)
             {
                 cumulative += histogram[value];
                 if (cumulative > targetIndex)
@@ -214,11 +203,6 @@ public sealed class ThresholdMarkerDetector
                     break;
                 }
             }
-        }
-
-        for (int i = 0; i < touchedCount; ++i)
-        {
-            histogram[histogramTouchedBins[i]] = 0;
         }
 
         return Math.Max(threshold, minimumThreshold);
@@ -241,7 +225,6 @@ public sealed class ThresholdMarkerDetector
     private void ApplyMorphologyIfNeeded()
     {
         if (morphologyKernelSize <= 1) return;
-        EnsureMorphologyBuffers();
 
         for (int i = 0; i < morphologyOpenIterations; ++i)
         {
@@ -258,16 +241,12 @@ public sealed class ThresholdMarkerDetector
 
     private void FindDetections(ushort[] frame, int threshold, ushort frameMax)
     {
-        if (componentLabelBase > int.MaxValue - pixelCount - 1)
-        {
-            Array.Clear(labels, 0, labels.Length);
-            componentLabelBase = 0;
-        }
+        Array.Clear(labels, 0, labels.Length);
 
-        int componentLabel = componentLabelBase;
+        int componentLabel = 0;
         for (int index = 0; index < pixelCount; ++index)
         {
-            if (binary[index] == 0 || labels[index] > componentLabelBase) continue;
+            if (binary[index] == 0 || labels[index] != 0) continue;
 
             componentLabel++;
             Component component = FloodFillComponent(frame, index, componentLabel);
@@ -291,8 +270,6 @@ public sealed class ThresholdMarkerDetector
                 new Vector2(component.MinX + componentWidth * 0.5f, component.MinY + componentHeight * 0.5f),
                 confidence));
         }
-
-        componentLabelBase = componentLabel;
     }
 
     private Component FloodFillComponent(ushort[] frame, int startIndex, int componentLabel)
@@ -337,7 +314,7 @@ public sealed class ThresholdMarkerDetector
                     if (nx < 0 || nx >= width) continue;
 
                     int neighborIndex = ny * width + nx;
-                    if (binary[neighborIndex] == 0 || labels[neighborIndex] > componentLabelBase) continue;
+                    if (binary[neighborIndex] == 0 || labels[neighborIndex] != 0) continue;
 
                     labels[neighborIndex] = componentLabel;
                     floodQueue[tail++] = neighborIndex;
@@ -585,24 +562,6 @@ public sealed class ThresholdMarkerDetector
                 target[rowOffset + x] = keep ? (byte)1 : (byte)0;
             }
         }
-    }
-
-    private void EnsureMorphologyBuffers()
-    {
-        if (morphologyBufferA == null || morphologyBufferA.Length != pixelCount)
-        {
-            morphologyBufferA = new byte[pixelCount];
-        }
-
-        if (morphologyBufferB == null || morphologyBufferB.Length != pixelCount)
-        {
-            morphologyBufferB = new byte[pixelCount];
-        }
-    }
-
-    private static int CompareDetectionConfidenceDescending(Detection left, Detection right)
-    {
-        return right.Confidence.CompareTo(left.Confidence);
     }
 
     private struct Detection

@@ -7,8 +7,6 @@ using System.Net.Sockets;
 /// </summary>
 public class SimpleTcpClient : IDisposable
 {
-    private static readonly byte[] FramingNegotiationBytes = { SimpleTcpProtocolUtils.FramingStrategyL };
-
     private readonly Socket socket;
     private readonly byte[] lengthPrefixBuffer;
     private readonly object closeLock = new object();
@@ -55,7 +53,7 @@ public class SimpleTcpClient : IDisposable
         try
         {
             socket.Connect(host, port);
-            SendAll(FramingNegotiationBytes, FramingNegotiationBytes.Length);
+            SendAll(new[] { SimpleTcpProtocolUtils.FramingStrategyL }, 1);
             IsConnected = true;
             isClosed = false;
             LastError = string.Empty;
@@ -70,22 +68,7 @@ public class SimpleTcpClient : IDisposable
 
     public byte[] Request(byte[] msg)
     {
-        byte[] responseBuffer = null;
-        int responseLength = Request(msg, ref responseBuffer);
-        if (responseLength < 0) return null;
-
-        byte[] response = new byte[responseLength];
-        if (responseLength > 0)
-        {
-            Buffer.BlockCopy(responseBuffer, 0, response, 0, responseLength);
-        }
-
-        return response;
-    }
-
-    public int Request(byte[] msg, ref byte[] responseBuffer)
-    {
-        if (!IsConnected) return -1;
+        if (!IsConnected) return null;
 
         try
         {
@@ -95,7 +78,7 @@ public class SimpleTcpClient : IDisposable
         {
             LastError = $"Send failed: {ex.Message}";
             Close();
-            return -1;
+            return null;
         }
 
         try
@@ -104,37 +87,32 @@ public class SimpleTcpClient : IDisposable
             {
                 LastError = "Remote endpoint closed the connection while reading the response length.";
                 Close();
-                return -1;
+                return null;
             }
 
-            uint responseLengthUInt = SimpleTcpProtocolUtils.ReadUInt32BigEndian(lengthPrefixBuffer);
-            if (responseLengthUInt > SimpleTcpProtocolUtils.MaxResponseBytes)
+            uint responseLength = SimpleTcpProtocolUtils.ReadUInt32BigEndian(lengthPrefixBuffer);
+            if (responseLength > SimpleTcpProtocolUtils.MaxResponseBytes)
             {
-                LastError = $"Response is too large: {responseLengthUInt} bytes.";
+                LastError = $"Response is too large: {responseLength} bytes.";
                 Close();
-                return -1;
+                return null;
             }
 
-            int responseLength = (int)responseLengthUInt;
-            if (responseBuffer == null || responseBuffer.Length < responseLength)
-            {
-                responseBuffer = new byte[responseLength];
-            }
-
-            if (!ReceiveExact(responseBuffer, responseLength))
+            byte[] response = new byte[responseLength];
+            if (!ReceiveExact(response, response.Length))
             {
                 LastError = "Remote endpoint closed the connection while reading the response body.";
                 Close();
-                return -1;
+                return null;
             }
 
-            return (int)responseLength;
+            return response;
         }
         catch (Exception ex)
         {
             LastError = $"Receive failed: {ex.Message}";
             Close();
-            return -1;
+            return null;
         }
     }
 
