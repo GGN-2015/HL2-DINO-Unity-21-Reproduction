@@ -19,12 +19,16 @@ public sealed class AimToolModelTracker : MonoBehaviour
     public int maxObservedMarkers = 32;
     public int maxSearchNodesPerTool = 200000;
     public float lostVisibilityTimeoutSeconds = 0.25f;
+    public float jitterSmoothingDistanceMetres = 0.01f;
+    [Range(0f, 1f)]
+    public float jitterSmoothingFactor = 0.35f;
     public bool hideModelsWhenUnmatched = true;
     public bool logMatches = false;
 
     [Header("Rendering")]
     public bool overrideModelMaterials = true;
     public Color modelColor = new Color(0.15f, 0.75f, 1f, 0.45f);
+    public int modelRenderQueue = 2990;
 
     private readonly List<AimToolRuntimeModel> models = new List<AimToolRuntimeModel>();
     private Material sharedModelMaterial;
@@ -97,7 +101,8 @@ public sealed class AimToolModelTracker : MonoBehaviour
                 Name = modelName,
                 Prefab = prefab,
                 MarkerLocalPositions = ConvertMarkers(markerSet.markers),
-                LastMatchTime = float.NegativeInfinity
+                LastMatchTime = float.NegativeInfinity,
+                HasSmoothedPose = false
             };
 
             models.Add(model);
@@ -166,7 +171,7 @@ public sealed class AimToolModelTracker : MonoBehaviour
             if (model.Instance == null) continue;
 
             if (!model.Instance.activeSelf) model.Instance.SetActive(true);
-            model.Instance.transform.SetPositionAndRotation(candidate.Match.Translation, candidate.Match.Rotation);
+            ApplyPoseWithJitterSmoothing(model, candidate.Match.Translation, candidate.Match.Rotation);
             model.LastMatchTime = Time.unscaledTime;
         }
 
@@ -346,7 +351,30 @@ public sealed class AimToolModelTracker : MonoBehaviour
         if ((neverMatched || stale) && model.Instance.activeSelf)
         {
             model.Instance.SetActive(false);
+            model.HasSmoothedPose = false;
         }
+    }
+
+    private void ApplyPoseWithJitterSmoothing(AimToolRuntimeModel model, Vector3 targetPosition, Quaternion targetRotation)
+    {
+        Vector3 outputPosition = targetPosition;
+        Quaternion outputRotation = targetRotation;
+
+        if (model.HasSmoothedPose)
+        {
+            float displacement = Vector3.Distance(model.SmoothedPosition, targetPosition);
+            if (displacement <= Mathf.Max(0f, jitterSmoothingDistanceMetres))
+            {
+                float t = Mathf.Clamp01(jitterSmoothingFactor);
+                outputPosition = Vector3.Lerp(model.SmoothedPosition, targetPosition, t);
+                outputRotation = Quaternion.Slerp(model.SmoothedRotation, targetRotation, t);
+            }
+        }
+
+        model.SmoothedPosition = outputPosition;
+        model.SmoothedRotation = outputRotation;
+        model.HasSmoothedPose = true;
+        model.Instance.transform.SetPositionAndRotation(outputPosition, outputRotation);
     }
 
     private Material GetSharedModelMaterial()
@@ -366,7 +394,7 @@ public sealed class AimToolModelTracker : MonoBehaviour
             sharedModelMaterial.DisableKeyword("_ALPHATEST_ON");
             sharedModelMaterial.EnableKeyword("_ALPHABLEND_ON");
             sharedModelMaterial.DisableKeyword("_ALPHAPREMULTIPLY_ON");
-            sharedModelMaterial.renderQueue = 3000;
+            sharedModelMaterial.renderQueue = modelRenderQueue;
         }
 
         return sharedModelMaterial;
@@ -397,6 +425,9 @@ public sealed class AimToolModelTracker : MonoBehaviour
         public GameObject Instance;
         public List<Vector3> MarkerLocalPositions;
         public float LastMatchTime;
+        public bool HasSmoothedPose;
+        public Vector3 SmoothedPosition;
+        public Quaternion SmoothedRotation;
     }
 
     private struct AimToolModelCandidate

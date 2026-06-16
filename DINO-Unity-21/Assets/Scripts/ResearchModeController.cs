@@ -890,7 +890,7 @@ public class ResearchModeController : MonoBehaviour
         markerSphereMaterial.DisableKeyword("_ALPHATEST_ON");
         markerSphereMaterial.EnableKeyword("_ALPHABLEND_ON");
         markerSphereMaterial.DisableKeyword("_ALPHAPREMULTIPLY_ON");
-        markerSphereMaterial.renderQueue = 3000;
+        markerSphereMaterial.renderQueue = 3100;
         return markerSphereMaterial;
     }
 
