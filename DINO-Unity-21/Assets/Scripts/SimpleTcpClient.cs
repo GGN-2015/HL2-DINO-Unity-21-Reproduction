@@ -7,6 +7,8 @@ using System.Net.Sockets;
 /// </summary>
 public class SimpleTcpClient : IDisposable
 {
+    private static readonly byte[] FramingNegotiationBytes = { SimpleTcpProtocolUtils.FramingStrategyL };
+
     private readonly Socket socket;
     private readonly byte[] lengthPrefixBuffer;
     private readonly object closeLock = new object();
@@ -53,7 +55,7 @@ public class SimpleTcpClient : IDisposable
         try
         {
             socket.Connect(host, port);
-            SendAll(new[] { SimpleTcpProtocolUtils.FramingStrategyL }, 1);
+            SendAll(FramingNegotiationBytes, FramingNegotiationBytes.Length);
             IsConnected = true;
             isClosed = false;
             LastError = string.Empty;

@@ -3,6 +3,7 @@ using UnityEngine;
 using Newtonsoft.Json.Linq;
 using System.Linq;
 using ToolTrackingUtils;
+using System.Globalization;
 
 /** @file           ToolConfigUtilities.cs
  *  @brief          Unity helper functions for handling the info we read from a config .json object
@@ -218,9 +219,9 @@ namespace ToolConfigUtilities
 
                 try
                 {
-                    float x = float.Parse(xVal.ToString());
-                    float y = float.Parse(yVal.ToString());
-                    float z = float.Parse(zVal.ToString());
+                    float x = float.Parse(xVal.ToString(), CultureInfo.InvariantCulture);
+                    float y = float.Parse(yVal.ToString(), CultureInfo.InvariantCulture);
+                    float z = float.Parse(zVal.ToString(), CultureInfo.InvariantCulture);
                     Vector3 Location = new Vector3(x, y, z);
 
                     if (coordinateUnits == MatrixUtilities.MatrixUnits.mm) Location /= 1000;
@@ -294,10 +295,10 @@ namespace ToolConfigUtilities
                     for (int i = 0; i < coordinate.Count(); i++)
                     {
                         double value;
-                        if (double.TryParse(coordinate[i].ToString(), out value))
+                        if (double.TryParse(coordinate[i].ToString(), NumberStyles.Float, CultureInfo.InvariantCulture, out value))
                         {
                             // Convert to meters (divide by 1000)
-                            coordinate[i] = (value / 1000).ToString("F5");
+                            coordinate[i] = (value / 1000).ToString("F5", CultureInfo.InvariantCulture);
                         }
                     }
                 }
